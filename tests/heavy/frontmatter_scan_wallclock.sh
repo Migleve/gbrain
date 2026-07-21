@@ -25,8 +25,8 @@
 # at that scale the test passes BEFORE AND AFTER the fix, proving nothing.
 # This script's 60K-file budget is the minimum that catches the regression.
 #
-# Works on either PGLite (default, no DATABASE_URL required) or Postgres
-# (set DATABASE_URL to test the Postgres SQL paths).
+# This is intentionally PGLite-only: it isolates the filesystem scan from
+# any DATABASE_URL inherited by the heavy-test workflow.
 
 set -euo pipefail
 
@@ -42,6 +42,7 @@ TMP_GBRAIN_HOME=$(mktemp -d -t gbrain-fm-wallclock-home-XXXXXX)
 export GBRAIN_HOME="$TMP_GBRAIN_HOME"
 BRAIN_DIR=$(mktemp -d -t gbrain-fm-wallclock-brain-XXXXXX)
 LOG_DIR="$GBRAIN_HOME/audit"
+unset DATABASE_URL GBRAIN_DATABASE_URL
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/heavy-frontmatter_scan_wallclock-$TS.log"
 SURFACE_LOG="${TMPDIR:-/tmp}/heavy-frontmatter_scan_wallclock-$TS.log"
@@ -93,7 +94,7 @@ timeout 120s bun run src/cli.ts init --pglite --yes --no-embedding >> "$LOG" 2>&
 # Register the brain dir as a source. Use raw SQL since `gbrain sources add`
 # might not exist in this version-window; the schema is what doctor reads.
 echo "[fm_wallclock] register source..." | tee -a "$LOG"
-bun run -e "
+bun -e "
 import { PGLiteEngine } from './src/core/pglite-engine.ts';
 const e = new PGLiteEngine();
 await e.connect({});
