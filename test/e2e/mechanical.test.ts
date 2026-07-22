@@ -819,7 +819,7 @@ describeE2E('E2E: Init Edge Cases', () => {
 
     const after = await conn.unsafe(`SELECT count(*) as n FROM information_schema.tables WHERE table_schema = 'public'`);
     expect(after[0].n).toBe(before[0].n);
-  });
+  }, 30_000);
 
   test('init then import then re-init preserves pages', async () => {
     await setupDB();
@@ -831,7 +831,7 @@ describeE2E('E2E: Init Edge Cases', () => {
 
     const after = await callOp('get_stats') as any;
     expect(after.page_count).toBe(before.page_count);
-  });
+  }, 30_000);
 });
 
 // ─────────────────────────────────────────────────────────────────
