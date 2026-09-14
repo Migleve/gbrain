@@ -18,11 +18,16 @@ async function sync() {
     stdout: 'pipe', stderr: 'pipe', env: process.env,
   });
   children.add(child);
-  const timer = setTimeout(() => child.kill('SIGKILL'), 60_000);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill('SIGKILL');
+  }, 60_000);
   try {
     const [rc, stdout, stderr] = await Promise.all([
       child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
     ]);
+    if (timedOut) throw new Error('Sync process exceeded the 60-second timeout');
     return { rc, output: stdout + stderr };
   } finally {
     clearTimeout(timer);
