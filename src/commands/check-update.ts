@@ -214,7 +214,10 @@ export async function runCheckUpdate(args: string[]) {
   };
 
   if (json) {
-    console.log(JSON.stringify(result, null, 2));
+    // Await delivery before the CLI's forced exit; large changelogs exceed a pipe buffer.
+    const writer = Bun.stdout.writer();
+    writer.write(JSON.stringify(result, null, 2) + '\n');
+    await writer.flush();
   } else if (updateAvailable) {
     console.log(`GBrain update available: ${VERSION} → ${latestVersion}`);
     console.log(`Run: ${upgradeCmd}`);

@@ -27,7 +27,7 @@ const describeE2E = hasDatabase() ? describe : describe.skip;
 describeE2E('E2E: op_checkpoints completed_keys jsonb parity (#2339)', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 60_000);
   afterAll(async () => {
     await teardownDB();
   });

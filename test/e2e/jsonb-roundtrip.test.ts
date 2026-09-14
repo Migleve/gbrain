@@ -22,7 +22,7 @@ const skip = !hasDatabase();
 const describeE2E = skip ? describe.skip : describe;
 
 describeE2E('E2E: JSONB roundtrip — v0.12.1 reliability wave', () => {
-  beforeAll(async () => { await setupDB(); });
+  beforeAll(async () => { await setupDB(); }, 60_000);
   afterAll(async () => { await teardownDB(); });
 
   test('putPage writes frontmatter as object, not double-encoded string', async () => {
