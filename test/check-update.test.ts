@@ -142,7 +142,7 @@ describe('check-update CLI', () => {
   });
 
   test('--json returns valid JSON with required fields', async () => {
-    const proc = Bun.spawn(['bun', 'run', 'src/cli.ts', 'check-update', '--json'], {
+    const proc = Bun.spawn(['bun', '--preload', './test/fixtures/check-update/fetch.ts', 'src/cli.ts', 'check-update', '--json'], {
       cwd: new URL('..', import.meta.url).pathname,
       stdout: 'pipe',
       stderr: 'pipe',
@@ -156,6 +156,8 @@ describe('check-update CLI', () => {
     expect(output).toHaveProperty('update_available');
     expect(output).toHaveProperty('upgrade_command');
     expect(output).toHaveProperty('current_source', 'package-json');
-    expect(typeof output.update_available).toBe('boolean');
+    expect(output.update_available).toBe(true);
+    expect(output.changelog_diff).toContain('END-OF-CHANGELOG');
+    expect(output.changelog_diff.length).toBeGreaterThan(100_000);
   });
 });
