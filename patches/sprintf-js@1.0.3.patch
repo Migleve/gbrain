@@ -1,0 +1,30 @@
+diff --git a/src/sprintf.js b/src/sprintf.js
+index c0fc7c08b2e6fe38de2883034b8d28c8f34e9866..b8db5f1174fdd14d92b8d01bc1960f31bd4273a5 100644
+--- a/src/sprintf.js
++++ b/src/sprintf.js
+@@ -58,6 +58,8 @@
+                     is_positive = arg >= 0
+                 }
+ 
++                // Bound ECMAScript numeric precision for untrusted format strings.
++                var numeric_precision = match[7] ? Math.min(100, parseInt(match[7], 10)) : undefined
+                 switch (match[8]) {
+                     case "b":
+                         arg = arg.toString(2)
+@@ -73,13 +75,13 @@
+                         arg = JSON.stringify(arg, null, match[6] ? parseInt(match[6]) : 0)
+                     break
+                     case "e":
+-                        arg = match[7] ? arg.toExponential(match[7]) : arg.toExponential()
++                        arg = match[7] ? arg.toExponential(numeric_precision) : arg.toExponential()
+                     break
+                     case "f":
+-                        arg = match[7] ? parseFloat(arg).toFixed(match[7]) : parseFloat(arg)
++                        arg = match[7] ? parseFloat(arg).toFixed(numeric_precision) : parseFloat(arg)
+                     break
+                     case "g":
+-                        arg = match[7] ? parseFloat(arg).toPrecision(match[7]) : parseFloat(arg)
++                        arg = match[7] ? parseFloat(arg).toPrecision(Math.max(1, numeric_precision)) : parseFloat(arg)
+                     break
+                     case "o":
+                         arg = arg.toString(8)
