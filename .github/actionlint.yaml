@@ -1,0 +1,8 @@
+self-hosted-runner:
+  labels:
+    - ubuntu-latest
+    - ubuntu-latest
+    - ubuntu-latest
+    - ubuntu-latest
+    - ubuntu-latest
+    - ubuntu-24.04-arm

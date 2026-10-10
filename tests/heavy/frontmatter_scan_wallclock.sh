@@ -25,10 +25,14 @@
 # at that scale the test passes BEFORE AND AFTER the fix, proving nothing.
 # This script's 60K-file budget is the minimum that catches the regression.
 #
-# This is intentionally PGLite-only: it isolates the filesystem scan from
-# any DATABASE_URL inherited by the heavy-test workflow.
+# Works on either PGLite (default, no DATABASE_URL required) or Postgres
+# (set DATABASE_URL to test the Postgres SQL paths).
 
 set -euo pipefail
+
+# #3485: shared name floor — these scripts mutate whatever DATABASE_URL names
+# and are documented for direct invocation, so each sources the floor itself.
+source "$(dirname "$0")/_db_floor.sh"
 
 cd "$(dirname "$0")/../.."
 
@@ -42,7 +46,6 @@ TMP_GBRAIN_HOME=$(mktemp -d -t gbrain-fm-wallclock-home-XXXXXX)
 export GBRAIN_HOME="$TMP_GBRAIN_HOME"
 BRAIN_DIR=$(mktemp -d -t gbrain-fm-wallclock-brain-XXXXXX)
 LOG_DIR="$GBRAIN_HOME/audit"
-unset DATABASE_URL GBRAIN_DATABASE_URL
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/heavy-frontmatter_scan_wallclock-$TS.log"
 SURFACE_LOG="${TMPDIR:-/tmp}/heavy-frontmatter_scan_wallclock-$TS.log"
@@ -82,9 +85,9 @@ echo "[fm_wallclock] fixture seeded in ${SEED_ELAPSED}s" | tee -a "$LOG"
 # Step 2: init brain + register the source.
 # `--no-embedding` opts out of the embedding-provider hard-require (v0.37 D9).
 # This script measures doctor's frontmatter-scan wallclock — it never embeds —
-# so the CI runner doesn't need OPENAI_API_KEY / ZEROENTROPY_API_KEY / VOYAGE_API_KEY.
+# so the CI runner doesn't need OPENAI_API_KEY / VOYAGE_API_KEY.
 echo "[fm_wallclock] init brain..." | tee -a "$LOG"
-timeout 120s bun run src/cli.ts init --pglite --yes --no-embedding >> "$LOG" 2>&1 || {
+timeout 120s bun run src/cli.ts init --pglite --non-interactive --no-embedding >> "$LOG" 2>&1 || {
   echo "[fm_wallclock] FAIL: gbrain init exited non-zero" >&2
   echo "Log tail:" >&2
   tail -30 "$LOG" >&2
@@ -93,11 +96,22 @@ timeout 120s bun run src/cli.ts init --pglite --yes --no-embedding >> "$LOG" 2>&
 
 # Register the brain dir as a source. Use raw SQL since `gbrain sources add`
 # might not exist in this version-window; the schema is what doctor reads.
+# NOTE: must be `bun -e`, not `bun run -e` — `bun run` treats -e as an
+# unknown script name and dumps its usage/script listing with exit 0, so the
+# INSERT silently never ran and doctor scanned zero sources (vacuous pass).
+# Resolve the engine the same way the CLI does (config + env), so the source
+# lands in the DB doctor actually reads (Postgres when CI sets DATABASE_URL,
+# the PGLite brain otherwise) — a hardcoded `connect({})` is in-memory and
+# the INSERT would vanish.
 echo "[fm_wallclock] register source..." | tee -a "$LOG"
 bun -e "
-import { PGLiteEngine } from './src/core/pglite-engine.ts';
-const e = new PGLiteEngine();
-await e.connect({});
+import { loadConfig, toEngineConfig } from './src/core/config.ts';
+import { createEngine } from './src/core/engine-factory.ts';
+const cfg = loadConfig();
+if (!cfg) throw new Error('no gbrain config — init failed?');
+const engineConfig = toEngineConfig(cfg);
+const e = await createEngine(engineConfig);
+await e.connect(engineConfig);
 await e.initSchema();
 await e.executeRaw(
   \"INSERT INTO sources (id, name, local_path) VALUES ('fm-wallclock', 'Frontmatter wallclock test', \\\$1)\",

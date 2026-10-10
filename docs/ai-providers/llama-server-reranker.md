@@ -1,30 +1,29 @@
-# llama-server reranker (local) — Qwen3-Reranker, self-hosted ZE, any ZE-wire-shape provider
+# llama-server reranker (local) — Qwen3-Reranker and compatible endpoints
 
 [`llama-server`](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 is the HTTP wrapper that ships with llama.cpp. With `--reranking`, it
 exposes an OpenAI-style `POST /v1/rerank` endpoint that returns
 `{results: [{index, relevance_score}]}` — exactly the wire shape gbrain
-already drives for ZeroEntropy's hosted reranker. The
-`llama-server-reranker` recipe (added in v0.40.6.1) routes
-`gateway.rerank()` at your local llama.cpp instance instead of ZE.
+supports for cross-encoder rerankers. The
+`llama-server-reranker` recipe routes
+`gateway.rerank()` at your local llama.cpp instance.
 
-Two flavors of "local" this recipe covers:
+One supported local model family:
 
-- **Qwen3-Reranker** (0.6B / 4B / 8B) — open-weight cross-encoder; pull
-  the GGUF from HuggingFace and serve.
-- **Self-hosted ZeroEntropy** (`zerank-2`, `zerank-1-small`) — the
-  weights are on HuggingFace too. GGUF-convert them and serve them the
-  same way. **Quality is not guaranteed to match ZE-hosted:** GGUF
-  conversion + quantization + pooling/rank metadata + tokenizer special
-  tokens all affect scores. If you self-host ZE for production
-  retrieval, pin your own brain-relevant eval (
-  [docs/eval-bench.md](../eval-bench.md)) as a regression guard.
+- **Qwen3-Reranker** (0.6B / 4B / 8B) — open-weight cross-encoder. Qwen
+  publishes official GGUFs for its EMBEDDING models but not for the
+  rerankers, so pull a community GGUF conversion from HuggingFace (or
+  convert the official weights yourself) and serve.
 
 This recipe is the path override + recipe shape. Any provider whose
-request/response wire matches ZE/llama.cpp can use it by just pointing
-at a different base URL. Providers whose wire shape differs (Voyage uses
-`top_k` not `top_n`, returns `data[]` not `results[]`) need a separate
-recipe with adapter hooks — that lands in a follow-up plan.
+request/response wire matches llama.cpp can use it by just pointing
+at a different base URL. A provider whose request differs only in the
+top-N key declares it via the recipe's `top_param` — that's how the
+hosted Voyage reranker recipe (`voyage:rerank-2.5`, the new-install
+default, `top_k`) works. On the response side the gateway parser accepts
+both known array keys (`results[]` for llama.cpp, `data[]` for
+Voyage's REST — the shared item shape is `{index, relevance_score}`);
+a genuinely different item shape needs its own recipe with adapter hooks.
 
 ## Setup
 
@@ -44,24 +43,27 @@ across releases. The recipe sends to `/v1/rerank`.
 
 ### 2. Pull a reranker GGUF
 
-For Qwen3-Reranker-4B (quantized Q4_K_M is the sweet spot for CPU):
+For Qwen3-Reranker-4B (quantized Q4_K_M is the sweet spot for CPU),
+pull a community GGUF conversion. Qwen ships no official reranker GGUF
+repos (the official `Qwen/Qwen3-Reranker-4B` repo carries the raw
+weights only), so the conversion below is **community-maintained** —
+verify scores against your own eval before trusting it in production:
 
 ```bash
 # Pick a quant level — Q4_K_M is the usual CPU sweet spot.
 huggingface-cli download \
-  Qwen/Qwen3-Reranker-4B-GGUF qwen3-reranker-4b-q4_k_m.gguf \
+  mradermacher/Qwen3-Reranker-4B-GGUF Qwen3-Reranker-4B.Q4_K_M.gguf \
   --local-dir ./models
 ```
 
-For self-hosted ZeroEntropy weights, find a community GGUF conversion
-or convert from the HuggingFace weights yourself (out of scope of this
-doc — see llama.cpp's `convert_hf_to_gguf.py`).
+Prefer official provenance? Convert the real `Qwen/Qwen3-Reranker-4B`
+weights yourself with llama.cpp's `convert_hf_to_gguf.py`, then quantize.
 
 ### 3. Launch llama-server with --reranking AND --alias
 
 ```bash
 ./build/bin/llama-server \
-  --model ./models/qwen3-reranker-4b-q4_k_m.gguf \
+  --model ./models/Qwen3-Reranker-4B.Q4_K_M.gguf \
   --alias qwen3-reranker-4b \
   --reranking \
   --port 8081
@@ -136,6 +138,20 @@ gbrain config set search.reranker.timeout_ms 60000
 
 Per-call overrides in `SearchOpts.reranker_timeout_ms` still win for
 any single call.
+
+## Document size
+
+Every document handed to the reranker is capped before the call: about 1,400
+estimated tokens (a 6,000-character cut first, then a shrink by measured
+token ratio), always on a UTF-8-safe boundary so a lone surrogate never turns
+a 500 into a 400. Prose chunks (~300 words) pass through untouched; code or
+CJK chunks at the chunker ceiling lose part of their tail before scoring, the
+same trade the embed side already makes. The cap exists because a
+chunker-ceiling chunk plus the query plus the server-side reranker template
+does not fit llama-server's default 2048 ubatch, and a pooled self-hosted
+reranker answered that overflow with a 500 that `applyReranker` fails open
+on, silently serving raw RRF order. It applies to every provider, hosted
+included, and has no config knob.
 
 ## Budget caps + local rerank
 

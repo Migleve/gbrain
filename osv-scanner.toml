@@ -1,8 +1,0 @@
-# The published version remains flagged because no fixed release exists.
-# The executable package is patched through Bun's patchedDependencies; the
-# scanner workflow MUST first pass the installed-package regression tests.
-# Remove this exception and patch when an upstream fixed release is available.
-[[IgnoredVulns]]
-id = "GHSA-hp3w-g68c-fv3c"
-ignoreUntil = 2026-11-09
-reason = "Locally patched sprintf-js@1.0.3 bounds e/f/g numeric precision to ECMAScript limits; mandatory test/sprintf-precision.test.ts verifies the installed patch before each OSV scan. No upstream fixed release as of 2026-10-10."

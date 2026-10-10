@@ -12,6 +12,16 @@
 import type { BrainEngine } from './engine.ts';
 import type { TimelineBatchInput } from './engine.ts';
 import { buildGazetteer, findMentionedEntities, type Gazetteer } from './by-mention.ts';
+import { isCrossSourceLinksEnabled } from './link-extraction.ts';
+import { computeEffectiveDate } from './effective-date.ts';
+import { parseFrontmatter } from './backfill-effective-date.ts';
+import { isPrivatePage } from './search/private-visibility.ts';
+import { quarantineFilterFragment } from './quarantine.ts';
+import { maintenanceTransaction } from './persistence/attribution.ts';
+import { derivedWriteTrust } from './trust/taint.ts';
+import { derivedGateConfig, derivedGateInput, recordTimelineFlag, timelineRowAllowed } from './trust/derived-gate.ts';
+import { assessTimelineForGate } from './write-gate.ts';
+import { storedTrustTier, type TaintInput } from './trust/tier.ts';
 
 export interface ExtractTimelineFromMeetingsOpts {
   dryRun?: boolean;
@@ -37,26 +47,39 @@ export interface ExtractTimelineFromMeetingsResult {
   batch_errors: number;
   /** First batch-insert error message, when batch_errors > 0. */
   first_batch_error?: string;
+  /** #5575 B3: rows the write gate quarantined or rejected (timeline rows are skipped, not held). */
+  write_gate_skipped?: number;
 }
 
 interface MeetingRow {
+  id: number;
+  trust_tier: string | null;
   slug: string;
   source_id: string;
   title: string;
   effective_date: string | null;
+  frontmatter: unknown;
+  import_filename: string | null;
+  created_at: string | Date;
   updated_at: string | Date;
   compiled_truth: string;
   timeline: string;
 }
 
 interface AttendedEdgeRow {
-  from_slug: string;
-  from_source_id: string;
-  to_slug: string;
-  to_source_id: string;
+  meeting_slug: string;
+  meeting_source_id: string;
+  attendee_slug: string;
+  attendee_source_id: string;
 }
 
 const BATCH_SIZE = 200;
+// gbrain-base-v2 catch-all retypes old meeting pages to note while
+// preserving legacy_type, so this extractor treats those rows as meetings.
+const MEETING_PAGE_PREDICATE =
+  `(type = 'meeting' OR (type = 'note' AND frontmatter ->> 'legacy_type' = 'meeting'))`;
+const MEETING_EDGE_PREDICATE =
+  `(meeting.type = 'meeting' OR (meeting.type = 'note' AND meeting.frontmatter ->> 'legacy_type' = 'meeting'))`;
 
 export async function extractTimelineFromMeetings(
   engine: BrainEngine,
@@ -69,11 +92,12 @@ export async function extractTimelineFromMeetings(
   const sourceFilter = opts.sourceIdFilter ? `AND source_id = $1` : '';
   const meetingParams = opts.sourceIdFilter ? [opts.sourceIdFilter] : [];
   const meetings = await engine.executeRaw<MeetingRow>(
-    `SELECT slug, source_id, title, effective_date, updated_at,
-            compiled_truth, COALESCE(timeline, '') AS timeline
+    `SELECT id, trust_tier, slug, source_id, title, effective_date, frontmatter, import_filename,
+            created_at, updated_at, compiled_truth, COALESCE(timeline, '') AS timeline
        FROM pages
-      WHERE type = 'meeting'
+      WHERE ${MEETING_PAGE_PREDICATE}
         AND deleted_at IS NULL
+        AND ${quarantineFilterFragment('pages')}
         ${sourceFilter}
       ORDER BY effective_date DESC NULLS LAST, slug`,
     meetingParams,
@@ -83,24 +107,26 @@ export async function extractTimelineFromMeetings(
     return { meetings_scanned: 0, entries_created: 0, entities_touched: 0, batch_errors: 0 };
   }
 
-  // 2. Fetch all 'attended' edges (one round-trip, scoped to the loaded
-  // meeting source_ids). Build a Map<meetingSlug → attendees[]> for O(1)
-  // attendee lookup per meeting.
+  // 2. Fetch all 'attended' edges (one brain-wide round-trip — the SQL is NOT
+  // source-scoped; rows are filtered in JS to the loaded meetings below).
+  // Build a Map<meetingKey → attendees[]> for O(1) attendee lookup per meeting.
   const meetingKeys = new Set(meetings.map((m) => `${m.source_id}::${m.slug}`));
   const attendedEdges = await engine.executeRaw<AttendedEdgeRow>(
-    `SELECT pf.slug AS from_slug, pf.source_id AS from_source_id,
-            pt.slug AS to_slug, pt.source_id AS to_source_id
+    `SELECT meeting.slug AS meeting_slug, meeting.source_id AS meeting_source_id,
+            attendee.slug AS attendee_slug, attendee.source_id AS attendee_source_id
        FROM links l
-       JOIN pages pf ON pf.id = l.from_page_id
-       JOIN pages pt ON pt.id = l.to_page_id
+       JOIN pages meeting ON meeting.id IN (l.from_page_id, l.to_page_id)
+       JOIN pages attendee ON attendee.id = CASE WHEN meeting.id = l.from_page_id
+         THEN l.to_page_id ELSE l.from_page_id END
       WHERE l.link_type = 'attended'
-        AND pf.type = 'meeting'
-        AND pf.deleted_at IS NULL
-        AND pt.deleted_at IS NULL`,
+        AND ${MEETING_EDGE_PREDICATE}
+        AND attendee.type = 'person'
+        AND meeting.deleted_at IS NULL
+        AND attendee.deleted_at IS NULL`,
   );
   const attendeesByMeeting = new Map<string, AttendedEdgeRow[]>();
   for (const e of attendedEdges) {
-    const key = `${e.from_source_id}::${e.from_slug}`;
+    const key = `${e.meeting_source_id}::${e.meeting_slug}`;
     if (!meetingKeys.has(key)) continue;
     const list = attendeesByMeeting.get(key);
     if (list) list.push(e);
@@ -110,19 +136,35 @@ export async function extractTimelineFromMeetings(
   // 3. For each meeting, derive entity mentions (gazetteer-based) + merge
   // with attendee edges. Each (meeting, entity) produces ONE timeline row.
   const gazetteer = opts.gazetteer ?? await buildGazetteer(engine);
+  const allowCrossSource = await isCrossSourceLinksEnabled(engine);
 
   const batch: TimelineBatchInput[] = [];
+  // #5575 I2: the rows restate their meeting (no model), so a batch holds one meeting tier and is stamped with it.
+  const batchInputs: TaintInput[] = [];
+  const gateCfg = await derivedGateConfig(engine);
+  let gateSkipped = 0;
   let entriesCreated = 0;
   const entitiesTouched = new Set<string>();
   let meetingsScanned = 0;
+  let dateFallbacks = 0;
+  let undated = 0;
+  let privateSkipped = 0;
   let batchErrors = 0;
   let firstBatchError: string | undefined;
 
   async function flush() {
-    if (batch.length === 0) return;
+    if (batch.length === 0) { batchInputs.length = 0; return; }
     if (!dryRun) {
       try {
-        entriesCreated += await engine.addTimelineEntriesBatch(batch);
+        const trust = derivedWriteTrust({ channel: 'derive:meeting_timeline', inputs: batchInputs, projection: true });
+        // #5575 B3: the meeting title lands on other pages, so each row passes the write gate at the meeting's tier.
+        const kept = batch.map(row => ({ row, assessment: assessTimelineForGate(row, derivedGateInput(trust), gateCfg) })).filter(r => timelineRowAllowed(r.assessment));
+        gateSkipped += batch.length - kept.length;
+        entriesCreated += kept.length === 0 ? 0 : await maintenanceTransaction(engine, async tx => {
+          const count = await tx.addTimelineEntriesBatch(kept.map(r => r.row));
+          for (const r of kept) await recordTimelineFlag(tx, r.assessment, r.row);
+          return count;
+        }, trust);
       } catch (e) {
         // #2057: do NOT swallow. A bare `catch {}` here hid a brain-wide
         // timeline-write failure (the run reported 0 entries with no error).
@@ -137,6 +179,7 @@ export async function extractTimelineFromMeetings(
       entriesCreated += batch.length;
     }
     batch.length = 0;
+    batchInputs.length = 0;
   }
 
   for (const meeting of meetings) {
@@ -144,7 +187,32 @@ export async function extractTimelineFromMeetings(
       const updatedMs = new Date(meeting.updated_at).getTime();
       if (Number.isFinite(updatedMs) && updatedMs <= sinceMs) continue;
     }
-    if (!meeting.effective_date) continue; // can't write a timeline entry without a date
+    const frontmatter = parseFrontmatter(meeting.frontmatter);
+    // A private meeting must not fan its title/slug/date out onto other pages'
+    // timelines: the row carries no event_page_id (the (event_page_id, date)
+    // unique index allows one row per event, not one per attendee), so the
+    // remote private-event filter could never hide it. Fail closed: skip.
+    if (isPrivatePage({ frontmatter })) { privateSkipped++; continue; }
+    // put_page-written pages never get effective_date computed (column stays
+    // NULL); derive it exactly as `gbrain backfill effective_date` would —
+    // same filename recipe (import_filename, else the slug tail) — so a later
+    // backfill + re-run dedups against this row instead of doubling it. The
+    // 'fallback' source is updated_at/created_at: an import timestamp, never
+    // the meeting's date. A row dated from it would survive dedup as a twin of
+    // the correctly dated row, so such meetings are skipped, not dated.
+    let date = meeting.effective_date;
+    if (!date) {
+      const { date: computed, source } = computeEffectiveDate({
+        slug: meeting.slug,
+        frontmatter,
+        filename: meeting.import_filename || meeting.slug.split('/').pop()!,
+        createdAt: new Date(meeting.created_at),
+        updatedAt: new Date(meeting.updated_at),
+      });
+      if (!computed || source === 'fallback') { undated++; continue; }
+      date = computed.toISOString().slice(0, 10);
+      dateFallbacks++;
+    }
 
     meetingsScanned++;
     opts.onProgress?.(meetingsScanned, meetings.length, entriesCreated);
@@ -153,25 +221,29 @@ export async function extractTimelineFromMeetings(
     const summary = `Discussed in ${meeting.title}`;
     const sourceKey = `extract-timeline-from-meetings:${meeting.slug}`;
 
-    // Attendees (from 'attended' links).
+    // Attendees (from 'attended' links). An edge into ANOTHER source fans out
+    // only under `link_resolution.cross_source` — the same gate the mention
+    // lane below applies (the edge fetch above is brain-wide, not scoped).
     const attendees = attendeesByMeeting.get(meetingKey) ?? [];
     const targets = new Map<string, { slug: string; source_id: string }>();
     for (const e of attendees) {
-      targets.set(`${e.to_source_id}::${e.to_slug}`, {
-        slug: e.to_slug,
-        source_id: e.to_source_id,
+      if (!allowCrossSource && e.attendee_source_id !== meeting.source_id) continue;
+      targets.set(`${e.attendee_source_id}::${e.attendee_slug}`, {
+        slug: e.attendee_slug,
+        source_id: e.attendee_source_id,
       });
     }
 
     // Body mentions (gazetteer-based). Skip self-mention (meeting page
-    // referencing itself by title). The cross-source guard in
-    // findMentionedEntities already drops mentions targeting a different
-    // source than the gazetteer entry was built from.
+    // referencing itself by title). Mentions of entities in ANOTHER source
+    // are dropped by findMentionedEntities unless the operator opted in via
+    // `link_resolution.cross_source` (same switch as wikilink resolution).
     const body = meeting.compiled_truth + '\n\n' + meeting.timeline;
     if (body.trim()) {
       const mentions = findMentionedEntities(body, gazetteer, {
         fromSlug: meeting.slug,
         fromSourceId: meeting.source_id,
+        allowCrossSource,
       });
       for (const m of mentions) {
         targets.set(`${m.source_id}::${m.slug}`, {
@@ -182,25 +254,46 @@ export async function extractTimelineFromMeetings(
     }
 
     // Emit one timeline row per (entity, this meeting).
+    const input: TaintInput = { table: 'pages', id: Number(meeting.id), tier: storedTrustTier(meeting.trust_tier) };
+    if (targets.size && batchInputs.length && batchInputs[0].tier !== input.tier) await flush();
+    if (targets.size) batchInputs.push(input);
     for (const t of targets.values()) {
       batch.push({
         slug: t.slug,
         source_id: t.source_id,
-        date: meeting.effective_date,
+        date,
         source: sourceKey,
         summary,
       });
       entitiesTouched.add(`${t.source_id}::${t.slug}`);
-      if (batch.length >= BATCH_SIZE) await flush();
+      if (batch.length >= BATCH_SIZE) { await flush(); batchInputs.push(input); }
     }
   }
 
   await flush();
+  if (dateFallbacks > 0) {
+    console.error(
+      `[extract timeline] ${dateFallbacks} meeting(s) have no effective_date column value; dated from their frontmatter date or filename instead. ` +
+      `Run \`gbrain backfill effective_date\` to persist it.`,
+    );
+  }
+  if (undated > 0) {
+    console.error(
+      `[extract timeline] ${undated} meeting(s) skipped: no date in frontmatter or filename (import timestamps are never used as the meeting date). ` +
+      `Add a \`date:\` field or a YYYY-MM-DD filename prefix.`,
+    );
+  }
+  if (privateSkipped > 0) {
+    console.error(
+      `[extract timeline] ${privateSkipped} visibility: private meeting(s) skipped: a timeline row on another page cannot be hidden from remote readers.`,
+    );
+  }
   return {
     meetings_scanned: meetingsScanned,
     entries_created: entriesCreated,
     entities_touched: entitiesTouched.size,
     batch_errors: batchErrors,
     first_batch_error: firstBatchError,
+    ...(gateSkipped ? { write_gate_skipped: gateSkipped } : {}),
   };
 }

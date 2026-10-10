@@ -17,6 +17,12 @@ export const dashscope: Recipe = {
   name: 'Alibaba DashScope (灵积)',
   tier: 'openai-compat',
   implementation: 'openai-compatible',
+  // No shipped rate for these yet: they warn and run under a default cap; a
+  // user cap refuses them until `gbrain pricing set` registers one (X1 guard).
+  unpriced_models: [
+    'text-embedding-v3',
+    'text-embedding-v2',
+  ],
   base_url_default: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
   auth_env: {
     required: ['DASHSCOPE_API_KEY'],
@@ -31,6 +37,11 @@ export const dashscope: Recipe = {
       // path. Conservative declaration so the gateway pre-splits before
       // hitting whatever undocumented server-side limit exists.
       max_batch_tokens: 8192,
+      // DashScope's OpenAI-compat /embeddings endpoint rejects requests with
+      // more than 10 input items (documented Model Studio cap). The gateway's
+      // capBatchItems pre-split enforces this; max_batch_tokens above keeps
+      // guarding aggregate token size. Concept from community PRs #2643/#2405.
+      max_batch_items: 10,
       // text-embedding-v3 mixes English + CJK heavily; the tokenizer is
       // closer to Voyage density than OpenAI tiktoken for CJK-dominant
       // content. Conservative chars_per_token=2 leaves headroom.
