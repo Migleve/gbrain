@@ -1,3 +1,4 @@
+import { assertManagedFilesystemWrite } from './persistence/filesystem-guard.ts';
 /**
  * brain-writer — frontmatter validation/audit/auto-fix orchestrator.
  *
@@ -17,6 +18,7 @@
  */
 
 import { createHash } from 'crypto';
+import { load as yamlLoad } from 'js-yaml';
 import { existsSync, readFileSync, readdirSync, copyFileSync, writeFileSync, mkdirSync, lstatSync } from 'fs';
 import { join, relative, resolve, dirname, basename, isAbsolute } from 'path';
 import type { BrainEngine } from './engine.ts';
@@ -24,24 +26,62 @@ import type { ProgressReporter } from './progress.ts';
 import { gbrainPath } from './config.ts';
 import { collectGitVisibleFiles } from './git-visible-files.ts';
 import {
+  classifyImportHold,
   parseMarkdown,
   type ParseValidationCode,
   type ParseValidationError,
+  type ParseWarningCode,
+  yamlAliasesWithinLimit,
+  yamlBlockError,
 } from './markdown.ts';
-import { isSyncable, pruneDir, slugifyPath } from './sync.ts';
+import { isMarkdownFilePath, isSyncable, pruneDir, slugifyPath } from './sync.ts';
 
 export type { ParseValidationCode };
 
+/** Frontmatter validation is defined only for Markdown page files. */
+export function isFrontmatterScannablePath(path: string): boolean {
+  return isMarkdownFilePath(path) && isSyncable(path, { strategy: 'markdown' });
+}
+
 export interface AuditFix {
-  code: ParseValidationCode;
+  code: ParseValidationCode | ParseWarningCode;
   description: string;
 }
+
+/**
+ * #5988: per code, how many findings ingestion imports anyway (`recoverable`:
+ * e.g. YAML it reads by quoting a value) versus how many make the file a held
+ * import (`unrecoverable`: YAML it cannot read safely, a conflicting slug, a
+ * protected key in an unclosed fence).
+ */
+export type RecoverabilityByCode = Partial<Record<ParseValidationCode, { recoverable: number; unrecoverable: number }>>;
+
+/**
+ * #5988: files `gbrain repair frontmatter` can fix, by the cause it fixes:
+ * recoverable `YAML_PARSE`, `needs_interpretation` (the held reading needs a
+ * fold or a duplicate-key choice), a `#`-leading value YAML read as a comment
+ * (`FRONTMATTER_COMMENT_VALUE` on title/name/description/summary),
+ * `NESTED_QUOTES`, `NULL_BYTES`, `MISSING_CLOSE`, `SLUG_MISMATCH`. A file
+ * counts once in `files` and once per cause in `by_code`.
+ */
+export interface RepairableReport {
+  files: number;
+  by_code: Partial<Record<RepairableCause, number>>;
+  sample: string[];
+}
+
+export type RepairableCause = 'YAML_PARSE' | 'needs_interpretation' | 'FRONTMATTER_COMMENT_VALUE' | 'NESTED_QUOTES' | 'NULL_BYTES' | 'MISSING_CLOSE' | 'SLUG_MISMATCH';
+
+const REPAIRABLE_ERRORS: ReadonlySet<string> = new Set(['NESTED_QUOTES', 'NULL_BYTES', 'MISSING_CLOSE', 'SLUG_MISMATCH']);
+const RESCUE_KEYS: ReadonlySet<string> = new Set(['title', 'name', 'description', 'summary']);
 
 export interface PerSourceReport {
   source_id: string;
   source_path: string;
   total: number;
   errors_by_code: Partial<Record<ParseValidationCode, number>>;
+  recoverability_by_code?: RecoverabilityByCode;
+  repairable?: RepairableReport;
   sample: { path: string; codes: ParseValidationCode[] }[];
   ignoredMissingOpen: number;
   /** Did this source finish the walk, get interrupted, or never start?
@@ -62,6 +102,7 @@ export interface AuditReport {
   ok: boolean;
   total: number;
   errors_by_code: Partial<Record<ParseValidationCode, number>>;
+  recoverability_by_code?: RecoverabilityByCode;
   per_source: PerSourceReport[];
   scanned_at: string;
   ignored_missing_open?: number;
@@ -114,12 +155,36 @@ export function createFrontmatterBackup(filePath: string, opts: FrontmatterBacku
 // ---------------------------------------------------------------------------
 
 /**
+ * A cosmetic line rewrite is kept only when it reads back as the same value
+ * (#6157). A line that does not parse on its own is a repair target, so the
+ * rewrite is allowed. A line over the alias limit is never rewritten: its
+ * value could expand exponentially when compared.
+ */
+function rewriteKeepsYamlValue(before: string, after: string): boolean {
+  if (!yamlAliasesWithinLimit(before)) return false;
+  let original: unknown;
+  try {
+    original = yamlLoad(before);
+  } catch {
+    return true;
+  }
+  try {
+    return JSON.stringify(yamlLoad(after)) === JSON.stringify(original);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Mechanical auto-repair for the fixable subset of validation codes:
  *   - NULL_BYTES        — strip \x00 characters
  *   - NESTED_QUOTES     — rewrite `"... "inner" ..."` to single-quoted outer
  *   - MISSING_CLOSE     — insert `---` before the first heading found inside
  *                          the YAML zone
  *   - SLUG_MISMATCH     — remove `slug:` line (gbrain derives slug from path)
+ *                          when `opts.filePath` is given. It must be the path
+ *                          the slug derives from (relative to the brain or
+ *                          source root, #5053), never an absolute path.
  *
  * Idempotent: running twice is a no-op on already-clean input. Any error class
  * not in the list above is left untouched (e.g. EMPTY_FRONTMATTER, YAML_PARSE,
@@ -139,8 +204,21 @@ export function autoFixFrontmatter(
     fixes.push({ code: 'NULL_BYTES', description: 'Stripped null bytes' });
   }
 
-  // 2. MISSING_CLOSE — if there's an opener but no closer before a heading,
-  //    insert `---` immediately before the heading. Walk lines once.
+  // 2. MISSING_CLOSE — if there's an opener but no closer at all, insert
+  //    `---` immediately before the first heading-shaped line (best-effort
+  //    guess at where the frontmatter was meant to end).
+  //
+  //    Find the closer FIRST, scanning the full zone — do not stop at the
+  //    first `#`-prefixed line. A `#` line between the opening and closing
+  //    `---` is a YAML comment (comments are valid anywhere in a YAML
+  //    document), not a markdown heading; only the genuine absence of a
+  //    closing `---` counts as MISSING_CLOSE. Mirrors the fix applied to
+  //    the parseMarkdown validator in #2153 — this is the sibling
+  //    reimplementation in the auto-fixer and had the same bug (it broke
+  //    out of the scan on the first heading-shaped line, so a `#` comment
+  //    appearing before a real closing fence was misdetected as
+  //    MISSING_CLOSE and the fix inserted a spurious `---` that split
+  //    valid frontmatter in two, pushing the real keys into the body).
   {
     const lines = working.split('\n');
     let firstNonEmpty = -1;
@@ -149,24 +227,27 @@ export function autoFixFrontmatter(
     }
     if (firstNonEmpty >= 0 && lines[firstNonEmpty].trim() === '---') {
       let closeIdx = -1;
-      let headingIdx = -1;
       for (let i = firstNonEmpty + 1; i < lines.length; i++) {
-        const t = lines[i].trim();
-        if (t === '---') { closeIdx = i; break; }
-        if (/^#{1,6}\s/.test(t)) { headingIdx = i; break; }
+        if (lines[i].trim() === '---') { closeIdx = i; break; }
       }
-      if (closeIdx === -1 && headingIdx >= 0) {
-        const fixed = [
-          ...lines.slice(0, headingIdx),
-          '---',
-          '',
-          ...lines.slice(headingIdx),
-        ];
-        working = fixed.join('\n');
-        fixes.push({
-          code: 'MISSING_CLOSE',
-          description: `Inserted closing --- before heading at line ${headingIdx + 1}`,
-        });
+      if (closeIdx === -1) {
+        let headingIdx = -1;
+        for (let i = firstNonEmpty + 1; i < lines.length; i++) {
+          if (/^#{1,6}\s/.test(lines[i].trim())) { headingIdx = i; break; }
+        }
+        if (headingIdx >= 0) {
+          const fixed = [
+            ...lines.slice(0, headingIdx),
+            '---',
+            '',
+            ...lines.slice(headingIdx),
+          ];
+          working = fixed.join('\n');
+          fixes.push({
+            code: 'MISSING_CLOSE',
+            description: `Inserted closing --- before heading at line ${headingIdx + 1}`,
+          });
+        }
       }
     }
   }
@@ -226,7 +307,9 @@ export function autoFixFrontmatter(
           if (!clean) return "''";
           return clean.includes("'") ? `"${clean}"` : `'${clean}'`;
         });
-        lines[i] = `${prefix}[${reQuoted.join(', ')}]`;
+        const rewritten = `${prefix}[${reQuoted.join(', ')}]`;
+        if (!rewriteKeepsYamlValue(lines[i], rewritten)) continue;
+        lines[i] = rewritten;
         fixedAny = true;
       }
       if (fixedAny) {
@@ -242,7 +325,9 @@ export function autoFixFrontmatter(
 
   // 3. NESTED_QUOTES — rewrite `key: "...inner..."` lines that have 3+ unescaped
   //    double-quotes by switching the outer wrapper to single quotes and
-  //    leaving inner quotes alone.
+  //    leaving inner quotes alone. Only when the closed block fails to parse
+  //    (#6157): valid YAML, such as a block-scalar continuation line shaped
+  //    like `Key: "a", then "b"`, is never rewritten.
   {
     const lines = working.split('\n');
     let firstNonEmpty = -1;
@@ -254,8 +339,10 @@ export function autoFixFrontmatter(
       for (let i = firstNonEmpty + 1; i < lines.length; i++) {
         if (lines[i].trim() === '---') { closeIdx = i; break; }
       }
+      const block = lines.slice(firstNonEmpty + 1, closeIdx).join('\n');
+      const blockParses = closeIdx < lines.length && yamlBlockError(block) === null && yamlAliasesWithinLimit(block);
       let fixedAny = false;
-      for (let i = firstNonEmpty + 1; i < closeIdx; i++) {
+      for (let i = firstNonEmpty + 1; !blockParses && i < closeIdx; i++) {
         const m = lines[i].match(/^(\s*[A-Za-z_][\w-]*\s*:\s*)"(.*)"\s*(.*)$/);
         if (!m) continue;
         const [, prefix, inner, trailing] = m;
@@ -296,12 +383,119 @@ export function autoFixFrontmatter(
     // the slug field is present and mismatched.
     const re = /^slug:\s*(.+?)\s*$/m;
     const m = working.match(re);
-    if (m && m[1].replace(/^["']|["']$/g, '') !== expectedSlug) {
+    // #3772: keep a normalization-equivalent slug (its slugified spelling IS
+    // the path-derived slug) — export stamps these to preserve legacy page
+    // identities, and stripping it here would re-key the page on next import.
+    const declaredSlug = m ? m[1].replace(/^["']|["']$/g, '') : '';
+    if (m && declaredSlug !== expectedSlug && slugifyPath(declaredSlug) !== expectedSlug) {
       working = working.replace(re, '').replace(/\n{3,}/g, '\n\n');
       fixes.push({
         code: 'SLUG_MISMATCH',
         description: `Removed mismatched slug field (was "${m[1]}", expected "${expectedSlug}")`,
       });
+    }
+  }
+
+  return { content: working, fixes };
+}
+
+/** Keys whose `#`-leading value is rescued (quoted) under `includeAmbiguous`. */
+const COMMENT_RESCUE_KEYS: ReadonlySet<string> = new Set(['title', 'name', 'description', 'summary']);
+
+/** What ingestion reads from content: the values a safe repair must keep. */
+function ingestedReading(content: string): string {
+  const parsed = parseMarkdown(content, undefined, { validate: true });
+  if (parsed.errors?.some(error => error.code === 'YAML_PARSE' && !error.recoverable)) return '';
+  return JSON.stringify([parsed.frontmatter, parsed.title, parsed.type, parsed.tags]);
+}
+
+/** Parses with no YAML error at all (strict, no recovery needed) and earns no import hold. */
+function strictlyReadable(candidate: string): boolean {
+  const parsed = parseMarkdown(candidate, undefined, { validate: true });
+  return !parsed.errors?.some(error => error.code === 'YAML_PARSE') && classifyImportHold(parsed) === null;
+}
+
+/**
+ * Swap the YAML block between the fences for `block` (as `recoverFrontmatter`
+ * returns it: rows joined by `\n`, each keeping its own `\r`, a trailing empty
+ * row). Every line outside the block stays byte-identical, BOM included.
+ */
+function replaceFrontmatterBlock(content: string, block: string): string | null {
+  const lines = content.split('\n');
+  const open = lines.findIndex(line => line.trim().length > 0);
+  if (open < 0 || !/^---[ \t]*(?:ya?ml)?[ \t]*$/i.test(lines[open]!.replace(/^\uFEFF/, '').replace(/\r$/, ''))) return null;
+  const close = lines.findIndex((line, i) => i > open && /^---[\t ]*\r?$/.test(line));
+  const rows = block.split('\n');
+  if (close < 0 || rows.pop() !== '') return null;
+  return [...lines.slice(0, open + 1), ...rows, ...lines.slice(close)].join('\n');
+}
+
+/**
+ * #5988: rewrite frontmatter that ingestion can read but a strict YAML parser
+ * cannot. Safe by default: only the `quote` recoveries `parseMarkdown`
+ * applied, line by line (only recovered lines change; CRLF and BOM kept), and
+ * only when the rewritten file strict-parses to exactly the values ingestion
+ * read. `includeAmbiguous` adds the interpretive proposals (unquoted
+ * continuation lines folded into a value, a duplicated key resolved to the
+ * later line, an unclosed `[`/`{` quoted, a `#`-leading title quoted), each
+ * applied only when the result strict-parses with no hold.
+ */
+export function repairRecoverableFrontmatter(
+  content: string,
+  opts: { includeAmbiguous?: boolean } = {},
+): { content: string; fixes: AuditFix[] } {
+  const fixes: AuditFix[] = [];
+  let working = content;
+
+  const parsed = parseMarkdown(working, undefined, { validate: true });
+  const quotes = (parsed.warnings ?? []).filter(w => w.code === 'FRONTMATTER_RECOVERED' && w.kind === 'quote' && w.original !== undefined && w.replacement !== undefined);
+  if (quotes.length > 0) {
+    const lines = working.split('\n');
+    const applied = quotes.every(w => {
+      const line = lines[w.line - 1];
+      if (line === undefined) return false;
+      const eol = line.endsWith('\r') ? '\r' : '';
+      if (line.slice(0, line.length - eol.length) !== w.original) return false;
+      lines[w.line - 1] = w.replacement + eol;
+      return true;
+    });
+    const candidate = lines.join('\n');
+    if (applied && strictlyReadable(candidate) && ingestedReading(candidate) === ingestedReading(working)) {
+      working = candidate;
+      for (const w of quotes) fixes.push({ code: 'YAML_PARSE', description: `Quoted the value of "${w.key}" at line ${w.line} (value unchanged)` });
+    }
+  }
+
+  if (!opts.includeAmbiguous) return { content: working, fixes };
+
+  const proposal = parseMarkdown(working, undefined, { validate: true }).recovery;
+  if (proposal?.status === 'needs_interpretation') {
+    const candidate = replaceFrontmatterBlock(working, proposal.block);
+    if (candidate !== null && strictlyReadable(candidate)) {
+      working = candidate;
+      for (const step of proposal.steps) {
+        fixes.push({ code: 'YAML_PARSE', description: step.kind === 'fold' ? `Folded the unquoted lines after "${step.key}" (line ${step.line}) into its value`
+          : step.kind === 'dup' ? `Kept the later "${step.key}" (line ${step.line}) and dropped the earlier one (line ${step.otherLine})`
+          : step.kind === 'unclosed' ? `Quoted the unclosed [ or { value of "${step.key}" at line ${step.line} as text`
+          : `Quoted the value of "${step.key}" at line ${step.line} (value unchanged)` });
+      }
+    }
+  }
+
+  const comments = (parseMarkdown(working, undefined, { validate: true }).warnings ?? [])
+    .filter(w => w.code === 'FRONTMATTER_COMMENT_VALUE' && COMMENT_RESCUE_KEYS.has(w.key));
+  if (comments.length > 0) {
+    const lines = working.split('\n');
+    for (const w of comments) {
+      const line = lines[w.line - 1]!;
+      const eol = line.endsWith('\r') ? '\r' : '';
+      const value = line.slice(0, line.length - eol.length).replace(/^[A-Za-z_][\w-]*:[ \t]+/, '').trimEnd();
+      lines[w.line - 1] = `${w.key}: ${JSON.stringify(value)}${eol}`;
+    }
+    const candidate = lines.join('\n');
+    if (strictlyReadable(candidate)) {
+      working = candidate;
+      for (const w of comments) fixes.push({ code: 'FRONTMATTER_COMMENT_VALUE', description: `Quoted the #-leading value of "${w.key}" at line ${w.line} so it is no longer read as a comment` });
     }
   }
 
@@ -334,6 +528,7 @@ export function writeBrainPage(
   content: string,
   opts: { sourcePath: string; autoFix?: boolean; backupRoot?: string; backupRunId?: string },
 ): { fixes: AuditFix[]; backupPath?: string } {
+  assertManagedFilesystemWrite(filePath);
   const resolvedSource = resolve(opts.sourcePath);
   const resolvedTarget = resolve(filePath);
   if (resolvedTarget !== resolvedSource && !resolvedTarget.startsWith(resolvedSource + '/')) {
@@ -347,7 +542,7 @@ export function writeBrainPage(
   let toWrite = content;
   let fixes: AuditFix[] = [];
   if (opts.autoFix) {
-    const result = autoFixFrontmatter(content, { filePath });
+    const result = autoFixFrontmatter(content, { filePath: relative(resolvedSource, resolvedTarget) });
     toWrite = result.content;
     fixes = result.fixes;
   }
@@ -409,12 +604,18 @@ export interface ScanOpts {
   visitDir?: (dirPath: string) => void;
 }
 
+/** Timeout-arm winner for the COUNT-vs-deadline race in scanBrainSources.
+ *  A unique object so it can never collide with a legitimate COUNT result
+ *  (number | null). Module-private. */
+const DEADLINE_SENTINEL: unique symbol = Symbol('gbrain.scan.deadline');
+
 export async function scanBrainSources(
   engine: BrainEngine,
   opts: ScanOpts = {},
 ): Promise<AuditReport> {
   const sources = await listSources(engine, opts.sourceId);
   const totals: Partial<Record<ParseValidationCode, number>> = {};
+  const recoverabilityTotals: RecoverabilityByCode = {};
   const perSource: PerSourceReport[] = [];
   let grandTotal = 0;
   let ignoredMissingOpen = 0;
@@ -480,41 +681,43 @@ export async function scanBrainSources(
     // pool can make this await hang past the budget. Without the race, we'd
     // wait indefinitely AND defeat the wall-clock guarantee.
     let dbPageCount: number | null = null;
+    // Set when the deadline race's timeout arm wins: the verdict that the
+    // budget is spent, independent of any later Date.now() reading. Timer
+    // callbacks on loaded runners can fire measurably EARLY relative to the
+    // wall clock (a +1ms pad was drifted past in practice — see the flake
+    // lineage in test/brain-writer-partial-scan.test.ts and issue #2946), so
+    // the hung-COUNT path must not re-derive "did the deadline fire?" from
+    // the clock the timer just raced against.
+    let deadlineHit = false;
     if (opts.dbPageCountForSource) {
       try {
         if (opts.deadline) {
           const remainingMs = opts.deadline - Date.now();
           if (remainingMs <= 0) {
             dbPageCount = null;
+            deadlineHit = true;
           } else {
-            // Race COUNT against the deadline so a hung query can't eat the budget.
-            //
-            // Boundary overshoot (+1ms): the post-await deadline check at line
-            // ~512 uses `Date.now() >= deadline`. setTimeout fires AT OR AFTER
-            // the requested delay, so in theory the check always passes. In
-            // practice on heavily-loaded CI runners (8 parallel shards × 4
-            // concurrent test files = ~32 concurrent bun processes) we saw
-            // intermittent failures where the timer callback resolved
-            // microseconds BEFORE the wall-clock boundary, leaving Date.now()
-            // a tick below deadline and the skip-check evaluating false. The
-            // src-a scan then ran on a populated dir before src-b's
-            // between-source check caught up — causing
-            // `firstSource.status === 'skipped'` to receive 'scanned'.
-            //
-            // Adding 1ms guarantees the timer fires past the deadline by at
-            // least one millisecond regardless of runner timer drift. Cost is
-            // 1ms additional wall-clock latency on hung COUNT queries, which
-            // is operationally negligible. Flake repro:
-            // https://github.com/garrytan/gbrain/actions/runs/77611667786
-            dbPageCount = await Promise.race([
+            // Race COUNT against the deadline so a hung query can't eat the
+            // budget. The timeout arm resolves a private sentinel — NOT null —
+            // so a deadline win is distinguishable from a COUNT that resolved
+            // null (failed/absent count keeps its existing semantics).
+            const raced = await Promise.race([
               opts.dbPageCountForSource(src.id),
-              new Promise<null>(resolve => setTimeout(() => resolve(null), remainingMs + 1)),
+              new Promise<typeof DEADLINE_SENTINEL>(resolve =>
+                setTimeout(() => resolve(DEADLINE_SENTINEL), remainingMs)),
             ]);
+            if (raced === DEADLINE_SENTINEL) {
+              dbPageCount = null;
+              deadlineHit = true;
+            } else {
+              dbPageCount = raced;
+            }
           }
         } else {
           dbPageCount = await opts.dbPageCountForSource(src.id);
         }
       } catch {
+        // A throwing COUNT is a failed count, not a deadline verdict.
         dbPageCount = null;
       }
     }
@@ -524,11 +727,11 @@ export async function scanBrainSources(
     // status='partial' with files_scanned=0, which is misleading ("partial
     // scan" when actually nothing was scanned). Mark this source + remainder
     // as 'skipped' so the doctor message is honest.
-    // `>=` matches the between-source check above (line 445). The Promise.race
-    // setTimeout resolves null at exactly `remainingMs` from now, so post-await
-    // Date.now() often equals deadline within integer-ms precision — strict `>`
-    // missed those landings on CI and let the next scanOneSource run anyway.
-    if (opts.signal?.aborted || (opts.deadline && Date.now() >= opts.deadline)) {
+    // `deadlineHit` is the authoritative verdict for the hung-COUNT path (the
+    // sentinel above); the wall-clock re-check (`>=`, matching the
+    // between-source check at line ~445) still covers a COUNT that RESOLVED
+    // slowly enough to eat the budget without the timer winning.
+    if (opts.signal?.aborted || deadlineHit || (opts.deadline && Date.now() >= opts.deadline)) {
       if (abortedAtSource === null) {
         abortedAtSource = src.id;
       }
@@ -545,6 +748,11 @@ export async function scanBrainSources(
       const k = code as ParseValidationCode;
       totals[k] = (totals[k] ?? 0) + (n as number);
     }
+    for (const [code, split] of Object.entries(report.recoverability_by_code ?? {})) {
+      const into = recoverabilityTotals[code as ParseValidationCode] ??= { recoverable: 0, unrecoverable: 0 };
+      into.recoverable += split.recoverable;
+      into.unrecoverable += split.unrecoverable;
+    }
     if (report.status === 'partial' && abortedAtSource === null) {
       abortedAtSource = src.id;
     }
@@ -559,6 +767,7 @@ export async function scanBrainSources(
     ok: grandTotal === 0 && !hasPartialOrSkipped,
     total: grandTotal,
     errors_by_code: totals,
+    recoverability_by_code: recoverabilityTotals,
     per_source: perSource,
     scanned_at: new Date().toISOString(),
     ignored_missing_open: ignoredMissingOpen || undefined,
@@ -573,7 +782,9 @@ function scanOneSource(
   opts: ScanOpts,
 ): PerSourceReport {
   const errorsByCode: Partial<Record<ParseValidationCode, number>> = {};
+  const recoverability: RecoverabilityByCode = {};
   const sample: PerSourceReport['sample'] = [];
+  const repairable: RepairableReport = { files: 0, by_code: {}, sample: [] };
   const rootResolved = resolve(sourcePath);
   let scanned = 0;
   let total = 0;
@@ -595,7 +806,10 @@ function scanOneSource(
     // visitDir is consulted from walkDir directly (passed below). The
     // per-file visit closure doesn't need it.
     const relPath = relative(rootResolved, absPath);
-    if (!isSyncable(relPath, { strategy: 'markdown' })) return true;
+    // Frontmatter is a Markdown-only contract. Multimodal sync deliberately
+    // admits images under the markdown strategy, but parsing JPEG/PNG bytes as
+    // UTF-8 turns ordinary binary NULs into false NULL_BYTES findings.
+    if (!isFrontmatterScannablePath(relPath)) return true;
     scanned++;
     let content: string;
     try {
@@ -611,12 +825,31 @@ function scanOneSource(
       ignoredMissingOpen++;
       return false;
     });
+    const hold = classifyImportHold(parsed, { expectedSlug });
+    const causes = new Set<RepairableCause>();
+    for (const e of parsed.errors ?? []) {
+      if (e.code === 'YAML_PARSE' && e.recoverable) causes.add('YAML_PARSE');
+      else if (REPAIRABLE_ERRORS.has(e.code)) causes.add(e.code as RepairableCause);
+    }
+    if (hold?.reason === 'needs_interpretation') causes.add('needs_interpretation');
+    if ((parsed.warnings ?? []).some(w => w.code === 'FRONTMATTER_COMMENT_VALUE' && RESCUE_KEYS.has(w.key))) causes.add('FRONTMATTER_COMMENT_VALUE');
+    if (causes.size > 0) {
+      repairable.files++;
+      for (const cause of causes) repairable.by_code[cause] = (repairable.by_code[cause] ?? 0) + 1;
+      if (repairable.sample.length < SAMPLE_PER_SOURCE) repairable.sample.push(relPath);
+    }
     if (errs.length > 0) {
       total += errs.length;
       const codes: ParseValidationCode[] = [];
       for (const e of errs) {
         errorsByCode[e.code] = (errorsByCode[e.code] ?? 0) + 1;
         codes.push(e.code);
+        const held = e.code === 'YAML_PARSE' ? !e.recoverable
+          : e.code === 'SLUG_MISMATCH' ? hold?.code === 'frontmatter_slug_conflict'
+          : e.code === 'MISSING_CLOSE' && hold?.code === 'invalid_frontmatter';
+        const split = recoverability[e.code] ??= { recoverable: 0, unrecoverable: 0 };
+        if (held) split.unrecoverable++;
+        else split.recoverable++;
       }
       if (sample.length < SAMPLE_PER_SOURCE) {
         sample.push({ path: relPath, codes });
@@ -647,6 +880,8 @@ function scanOneSource(
     source_path: sourcePath,
     total,
     errors_by_code: errorsByCode,
+    recoverability_by_code: recoverability,
+    repairable,
     sample,
     ignoredMissingOpen,
     status: interrupted ? 'partial' : 'scanned',
@@ -733,7 +968,16 @@ async function listSources(engine: BrainEngine, sourceId?: string): Promise<Sour
     );
     return rows;
   }
-  return engine.executeRaw<SourceRow>(
-    `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL ORDER BY id`,
-  );
+  // #3880: archived sources are excluded from automatic all-source scanning.
+  // The archived column is v34+ — fall back on older brains (house style per
+  // pickSoleNonDefaultSource).
+  try {
+    return await engine.executeRaw<SourceRow>(
+      `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE ORDER BY id`,
+    );
+  } catch {
+    return engine.executeRaw<SourceRow>(
+      `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL ORDER BY id`,
+    );
+  }
 }

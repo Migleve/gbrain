@@ -356,6 +356,103 @@ export function isDbOnly(slug: string, config: StorageConfig): boolean {
   return config.db_only.some((dir) => matchesTierDir(slug, dir));
 }
 
+/**
+ * Declared db_only match for a page slug. Slugs are always lowercase, so the
+ * declared directory is lowercased before matching (same reasoning as
+ * `effectiveDbOnlyDirs`, issue #3766). Only declared dirs count: the
+ * derive-phase defaults may be file-backed on some brains.
+ */
+export function isDeclaredDbOnlySlug(slug: string, config: StorageConfig | null): boolean {
+  return config?.db_only.some((dir) => matchesTierDir(slug, dir.toLowerCase())) ?? false;
+}
+
+/**
+ * True when gbrain.yml has a `db_only` (or deprecated `supabase_only`) key
+ * line but no db_only directory resolved from it. `loadStorageConfig` warns
+ * and resolves nothing for syntax the narrow parser does not handle (e.g.
+ * flow-style `db_only: [dir/]`), so a caller that must not guess a tier
+ * refuses instead. Only YAML key lines count, not comments or prose that
+ * mention the word. Known false positive: an intentionally empty
+ * `db_only: []` also counts, since it resolves to the same empty config.
+ */
+export function hasUnresolvedDbOnlyDeclaration(repoPath: string, config: StorageConfig | null): boolean {
+  if (config && config.db_only.length > 0) return false;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- repoPath is the registered local source root and the file name is a constant; this only reads its gbrain.yml
+  const yamlPath = join(repoPath, 'gbrain.yml');
+  const yamlContent = existsSync(yamlPath) ? readFileSync(yamlPath, 'utf-8') : '';
+  return yamlContent.split('\n').some((line) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('#')) return false;
+    return /^(db_only|supabase_only)\s*:/.test(trimmed);
+  });
+}
+
+/**
+ * Derive-phase output prefixes the engine itself writes as DB-only machine
+ * output (issue #2784, reported by @alexputici). These are re-derivable by
+ * design and rarely file-backed, so the `undeclared_db_only_pages` doctor
+ * check treats them as implicitly declared db_only. They are deliberately
+ * NOT merged into `loadStorageConfig` — doing so would auto-gitignore these
+ * dirs via `manageGitignore` and silently kill ingestion for brains that DO
+ * file-back them (the exact #2788 silent-death class).
+ */
+export const DERIVE_PHASE_DB_ONLY_DEFAULTS: readonly string[] = [
+  'life/events/',
+  'atoms/',
+  // synthesize_concepts writes through importFromContent without creating a
+  // backing markdown file. Keep this implicit (rather than merging it into
+  // storage.db_only) so installations that do file-back concepts are never
+  // auto-gitignored by manageGitignore.
+  'concepts/',
+  'extracts/',
+  'dream-cycle-summaries/',
+];
+
+/**
+ * Declared db_only dirs plus the derive-phase defaults, deduped.
+ *
+ * `declared` is lowercased before the union (issue #3766): its only consumer
+ * (`checkUndeclaredDbOnlyPages`) matches these prefixes against page `slug`
+ * values via a plain `.startsWith()`, and slugs are ALWAYS lowercased at
+ * creation time (`pathToSlug`/`slugifyCodePath` in sync.ts) regardless of the
+ * host filesystem's case sensitivity. Without this, a `storage.db_only`
+ * entry typed with any uppercase (e.g. `Notes/` in gbrain.yml) silently never
+ * matches a single slug and every page under it gets falsely flagged as
+ * undeclared. This is deliberately NOT done in `normalizeAndValidateStorageConfig`
+ * / `loadStorageConfig` — `manageGitignore` (sync.ts) reads that raw,
+ * case-preserved config to write `.gitignore` entries that must match the
+ * REAL on-disk directory name (case-sensitive on Linux); lowercasing there
+ * would break gitignore management instead of fixing this doctor check.
+ */
+export function effectiveDbOnlyDirs(declared: string[]): string[] {
+  return [...new Set([...declared.map((d) => d.toLowerCase()), ...DERIVE_PHASE_DB_ONLY_DEFAULTS])];
+}
+
+/**
+ * Collector-output vs db_only collision detection (issue #2788, reported by
+ * @alexputici). A collector output path collides when it equals a db_only
+ * dir or sits anywhere inside one — such dirs are auto-gitignored by sync,
+ * so both the git-walking sync AND `gbrain import` (which honors .gitignore)
+ * silently skip every file the collector writes.
+ */
+export function findDbOnlyCollisions(
+  outputs: Array<{ id: string; output_path: string }>,
+  dbOnlyDirs: string[],
+): Array<{ id: string; output_path: string; db_only_dir: string }> {
+  const hits: Array<{ id: string; output_path: string; db_only_dir: string }> = [];
+  for (const o of outputs) {
+    const out = o.output_path.endsWith('/') ? o.output_path : o.output_path + '/';
+    for (const rawDir of dbOnlyDirs) {
+      const dir = rawDir.endsWith('/') ? rawDir : rawDir + '/';
+      if (out.startsWith(dir)) {
+        hits.push({ id: o.id, output_path: o.output_path, db_only_dir: rawDir });
+        break;
+      }
+    }
+  }
+  return hits;
+}
+
 export function getStorageTier(slug: string, config: StorageConfig): StorageTier {
   if (isDbTracked(slug, config)) return 'db_tracked';
   if (isDbOnly(slug, config)) return 'db_only';

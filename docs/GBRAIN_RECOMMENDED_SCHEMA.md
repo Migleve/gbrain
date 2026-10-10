@@ -6,6 +6,14 @@ A system prompt for any AI agent that wants to build and maintain a personal kno
 
 Drop this into your agent's workspace as a skill or system prompt. Your agent will build the rest.
 
+> **Relationship to schema packs:** this document is the prose, paste-in
+> version of the schema pattern. gbrain also ships a machine-enforced
+> counterpart — schema packs (`gbrain schema`, typed pages, extraction,
+> aliases, lint) — documented in `docs/architecture/schema-packs.md` and
+> `docs/schema-author-tutorial.md`. The prose schema here and the active
+> schema pack should describe the same brain; when you evolve one, evolve
+> the other.
+
 ---
 
 ## What this is
@@ -98,7 +106,7 @@ The markdown wiki is the human-facing layer — the primary interface for humans
 
 The markdown layer uses conventions that map directly to the database primitives:
 
-1. **Use frontmatter for structured metadata** — anything you'd want to query (role, company, stage, score, tags) goes in YAML frontmatter, not buried in prose. These map to the fact store.
+1. **Use frontmatter for structured metadata** — anything you'd want to filter on (role, company, stage, score, tags) goes in YAML frontmatter, not buried in prose. Frontmatter is metadata for filters and schema-pack rules: it is not written to the fact store, and `gbrain search` / `query` do not index scalar frontmatter values (only the page body is chunked). If a value must be findable by search, also state it in the body, for example `Stage: negotiation` (#5335).
 2. **Use `.raw/` for provenance** — save every API response with source and timestamp. These map to provenance records in the fact store.
 3. **Treat the timeline as an event stream** — dated, sourced, append-only. These map to the event ledger.
 4. **Keep compiled truth conceptually separate from evidence** — above the line is synthesis; below the line is evidence. The synthesis is a generated view; the evidence is queryable records.

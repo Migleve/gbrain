@@ -20,15 +20,15 @@
  * adapter in `extract-conversation-facts.ts` (T5 retrofit).
  *
  * Pure-function inner core: no I/O, no LLM calls except via the
- * polish/fallback wrappers in `llm-polish.ts` + `llm-fallback.ts`
- * (T4). Those wrappers are passed in via opts so this file stays
- * test-isolatable.
+ * fallback wrapper in `llm-fallback.ts` (T4). That wrapper is passed
+ * in via opts so this file stays test-isolatable.
  */
 
 import {
   BUILTIN_PATTERNS,
   cleanSpeaker,
 } from './builtins.ts';
+import { normalizeBlockConversation } from './normalize-block.ts';
 import type {
   DateContext,
   MatchedMessage,
@@ -299,6 +299,13 @@ function monthNameToIndex(name: string): number {
   return MONTHS_SHORT.indexOf(name.toLowerCase().slice(0, 3));
 }
 
+// #4136 — folded-heading detection constants. The label capture is capped at
+// 48 chars (privacy: labels can carry page text into stderr/JSON) and the
+// list at 10 entries per parse.
+const UNRECOGNIZED_HEADING_RE = /^(#{1,6})\s+(.{1,48}?)\s*:?\s*$/;
+const FENCE_RE = /^(```|~~~)/;
+const MAX_UNRECOGNIZED_HEADINGS = 10;
+
 /**
  * Apply ONE pattern to the full body. Returns the matched messages
  * with their ISO timestamps. Handles multi-line continuations per D5.
@@ -317,17 +324,80 @@ export function applyPattern(
   body: string,
   entry: PatternEntry,
   dateCtx: DateContext,
+  diag?: { unrecognized_headings: string[]; date_fallback_count?: number },
 ): MatchedMessage[] {
   if (!body) return [];
   const out: MatchedMessage[] = [];
   const lines = body.split(/\r?\n/);
+  const allowedAnchors = entry.id === 'python-dict-utterance'
+    ? speakerObjectAnchorsAllowed(body, entry)
+    : undefined;
+  // Some multi-day conversation exports use markdown date headings instead
+  // of repeating a date on every message. Keep the caller's context immutable
+  // while advancing a local date anchor as those headings are encountered.
+  const runningCtx: DateContext = { ...dateCtx };
+  const dateHeaderRe = /^#{1,4}\s+(\d{4}-\d{2}-\d{2})\s*$/;
+  // #4136 — when the WINNING pattern anchors on headings, a heading-shaped
+  // line whose label is outside the pattern's closed speaker set is not
+  // rejected and not reported: it folds into the PREVIOUS turn's body
+  // (heading line and all), or drops silently before the first anchor.
+  // The parse still returns phase 'regex_match', so one speaker gets
+  // credited with another's words and nothing downstream declines. Detection
+  // is diagnostic-only (zero behavior change here): collect the folded
+  // labels so ParseResult can surface them. Fence-aware so a transcript
+  // whose answers paste markdown/shell inside code fences is not flagged.
+  // A heading anchor that carries its own inline date (email-thread-heading)
+  // cannot be mistaken for a section title, so its other headings are body
+  // text, not lost speakers.
+  const headingAnchored =
+    diag !== undefined &&
+    entry.multi_line === true &&
+    entry.score_continuations_as_body === true &&
+    entry.captures.date_group === undefined &&
+    (entry.test_positive ?? []).some((s) => /^#{2,3}\s/.test(s));
+  let fenceMarker: '```' | '~~~' | null = null;
+  const collectFoldedHeading = (line: string): void => {
+    if (!headingAnchored || fenceMarker !== null || !diag) return;
+    if (diag.unrecognized_headings.length >= MAX_UNRECOGNIZED_HEADINGS) return;
+    const h = UNRECOGNIZED_HEADING_RE.exec(line);
+    if (!h) return;
+    const label = h[2].trim();
+    // Speaker-shaped-ish cap: ≤3 whitespace tokens, no sentence punctuation
+    // tail — long prose headings are section titles, not lost speakers.
+    if (!label || label.split(/\s+/).length > 3 || /[.!?]$/.test(label)) return;
+    if (entry.regex.test(line)) return; // a real anchor, not a fold
+    if (!diag.unrecognized_headings.includes(label)) diag.unrecognized_headings.push(label);
+  };
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
     const line = rawLine.trim();
     if (!line) continue;
+    if (headingAnchored) {
+      // Adversarial F6 (partial): a fence closes only on ITS OWN marker —
+      // CommonMark treats a mismatched marker as content, so `~~~` must not
+      // close a ```-opened fence. (An UNCLOSED fence still suppresses
+      // detection for the rest of the document — CommonMark-consistent, and
+      // the fail direction is warn-noise-free but detection-free; noted in
+      // the PR body as a known residual for truncated-LLM-output corpora.)
+      const fm = FENCE_RE.exec(line)?.[1] as '```' | '~~~' | undefined;
+      if (fm) {
+        if (fenceMarker === null) fenceMarker = fm;
+        else if (fenceMarker === fm) fenceMarker = null;
+      }
+    }
+
+    if (allowedAnchors?.[i] === false) continue;
+    const dateHeader = dateHeaderRe.exec(line);
+    if (dateHeader) {
+      runningCtx.fallbackDate = dateHeader[1];
+      continue;
+    }
+
+    if (allowedAnchors && !entry.regex.test(line)) continue;
 
     // Quick-reject fast path.
     if (entry.quick_reject && !entry.quick_reject.test(line)) {
+      collectFoldedHeading(line); // #4136 — folded below or dropped pre-anchor
       // Continuation handling for orphan lines.
       if (out.length > 0) {
         out[out.length - 1].text = out[out.length - 1].text
@@ -339,8 +409,17 @@ export function applyPattern(
 
     const m = entry.regex.exec(line);
     if (m) {
-      const iso = buildIso(m, entry, dateCtx);
-      if (iso === null) continue; // reconstruction failed; skip line
+      let iso = buildIso(m, entry, runningCtx);
+      if (iso === null) {
+        // Reconstruction failed (e.g. a localized month name). Dropping the
+        // anchor would fold this message's body into the PREVIOUS speaker
+        // (silent misattribution, phase still regex_match), so open the
+        // message anyway and count it. Inherit the previous anchor's
+        // timestamp so ordering and downstream segment continuity survive;
+        // midnight of the page date only when this is the first anchor.
+        iso = out[out.length - 1]?.timestamp ?? `${runningCtx.fallbackDate}T00:00:00Z`;
+        if (diag) diag.date_fallback_count = (diag.date_fallback_count ?? 0) + 1;
+      }
       const rawSpeaker = m[entry.captures.speaker_group] ?? '';
       const speaker = cleanSpeaker(rawSpeaker, entry.speaker_clean);
       let text = '';
@@ -351,11 +430,16 @@ export function applyPattern(
       // (Even when text_group is set, multi_line=true means SUBSEQUENT
       // non-anchor lines also absorb into this message's body.)
       out.push({ speaker, timestamp: iso, text });
-    } else if (out.length > 0) {
-      // Continuation line.
-      out[out.length - 1].text = out[out.length - 1].text
-        ? `${out[out.length - 1].text}\n${line}`
-        : line;
+    } else {
+      // Passed quick_reject but failed the full regex (e.g. '## Assistant
+      // Bot' against the closed-set heading pattern) — the OTHER fold site.
+      collectFoldedHeading(line); // #4136
+      if (out.length > 0) {
+        // Continuation line.
+        out[out.length - 1].text = out[out.length - 1].text
+          ? `${out[out.length - 1].text}\n${line}`
+          : line;
+      }
     }
   }
   return out;
@@ -375,13 +459,93 @@ function getNonBlankLines(body: string, headCap?: number): string[] {
   return headCap !== undefined ? all.slice(0, headCap) : all;
 }
 
+function speakerObjectAnchorsAllowed(body: string, entry: PatternEntry): boolean[] {
+  let fence: string | undefined;
+  let inTranscript: boolean | undefined;
+  let invalidRegion = false;
+  let malformedPreamble = false;
+  let preambleQuote: string | undefined;
+  const preambleClosers: string[] = [];
+  const scanPreamble = (line: string): void => {
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+      if (preambleQuote) {
+        if (char === '\\') i++;
+        else if (line.startsWith(preambleQuote, i)) {
+          i += preambleQuote.length - 1;
+          preambleQuote = undefined;
+        }
+        continue;
+      }
+      if (char === "'" || char === '"' || char === '`') {
+        let wordStart = i;
+        while (wordStart > 0 && /[\p{L}\p{N}_]/u.test(line[wordStart - 1])) wordStart--;
+        const word = line.slice(wordStart, i);
+        if (char === "'" && word && !/^(?:r|u|b|f|fr|rf|br|rb)$/i.test(word)) continue;
+        preambleQuote = line.startsWith(char.repeat(3), i) ? char.repeat(3) : char;
+        i += preambleQuote.length - 1;
+      } else if (char === '{') preambleClosers.push('}');
+      else if (char === '[') preambleClosers.push(']');
+      else if (char === '(') preambleClosers.push(')');
+      else if ('}])'.includes(char) && preambleClosers.length > 0 && preambleClosers.pop() !== char) malformedPreamble = true;
+    }
+  };
+  const allowed = body.split(/\r?\n/).map(raw => {
+    const line = raw.trim();
+    if (malformedPreamble || preambleQuote || preambleClosers.length > 0) {
+      if (entry.regex.test(line) || /^#{1,6}\s+Transcript\s*$/i.test(line)) invalidRegion = true;
+      if (!malformedPreamble) scanPreamble(line);
+      return false;
+    }
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(raw);
+    if (fence) {
+      if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = undefined;
+      return false;
+    }
+    if (marker) {
+      fence = marker[1];
+      return false;
+    }
+    if (!line || /^(?: {4}| *\t)/.test(raw)) return false;
+    if (/^#{1,6}\s+Transcript\s*$/i.test(line)) {
+      inTranscript = true;
+      return false;
+    }
+    if (/^#{1,4}\s+\d{4}-\d{2}-\d{2}\s*$/.test(line)) return inTranscript !== false;
+    if (/^#{1,6}\s/.test(line)) {
+      inTranscript = false;
+      scanPreamble(line);
+      return false;
+    }
+    const matches = entry.regex.test(line);
+    if (inTranscript === undefined) {
+      inTranscript = matches;
+      if (!matches) invalidRegion = true;
+    } else if (inTranscript && !matches) {
+      invalidRegion = true;
+    } else if (!inTranscript) {
+      scanPreamble(line);
+    }
+    return inTranscript && matches;
+  });
+  return invalidRegion ? allowed.fill(false) : allowed;
+}
+
+function speakerObjectScoringLines(body: string, entry: PatternEntry, headCap?: number): string[] {
+  const allowed = speakerObjectAnchorsAllowed(body, entry);
+  const lines = body.split(/\r?\n/)
+    .map((line, index) => ({ line: line.trim(), allowed: allowed[index] }))
+    .filter(({ line }) => line.length > 0)
+    .map(({ line, allowed }) => allowed ? line : '');
+  return headCap === undefined ? lines : lines.slice(0, headCap);
+}
+
 /**
  * Core scorer over a pre-split line array. Both `scorePattern` (head
  * window) and `scorePatternFull` (whole body) delegate here so the
  * quick_reject + regex loop lives in one place. Reused by
- * `parseConversation`'s fallback path which pre-splits ONCE and
- * passes the array to all 12 candidates (saves 11 redundant body
- * splits per fallback pass).
+ * `parseConversation`'s fallback path shares a pre-split array across
+ * candidates that use ordinary line scoring.
  */
 function scoreFromLines(
   lines: readonly string[],
@@ -389,9 +553,66 @@ function scoreFromLines(
 ): number {
   if (lines.length === 0) return 0;
   let anchored = 0;
-  for (const line of lines) {
-    if (entry.quick_reject && !entry.quick_reject.test(line)) continue;
-    if (entry.regex.test(line)) anchored++;
+  let anchorCandidates = 0;
+  let firstLineAnchored = false;
+  let firstAnchorIndex = -1;
+  // Only populated when score_continuations_min_distinct_speakers is set
+  // (avoids a Set + exec() per line for every other pattern, which only
+  // needs the boolean match `test()` already gave before this change).
+  const tracksDistinctSpeakers =
+    entry.score_continuations_min_distinct_speakers !== undefined;
+  const distinctSpeakers: Set<string> | undefined = tracksDistinctSpeakers
+    ? new Set()
+    : undefined;
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (entry.quick_reject && !entry.quick_reject.test(line)) {
+      continue;
+    }
+    anchorCandidates++;
+    let isMatch: boolean;
+    if (distinctSpeakers) {
+      const m = entry.regex.exec(line);
+      isMatch = m !== null;
+      if (m) {
+        const speaker = m[entry.captures.speaker_group];
+        if (speaker) distinctSpeakers.add(speaker);
+      }
+    } else {
+      isMatch = entry.regex.test(line);
+    }
+    if (isMatch) {
+      anchored++;
+      if (index === 0) firstLineAnchored = true;
+      if (firstAnchorIndex === -1) firstAnchorIndex = index;
+    }
+  }
+
+  const distinctSpeakersOk =
+    entry.score_continuations_min_distinct_speakers === undefined ||
+    (distinctSpeakers?.size ?? 0) >=
+      entry.score_continuations_min_distinct_speakers;
+  // Bounds how far into the body the FIRST anchor may appear before the
+  // candidate-only density score activates. A genuine export's anchor
+  // grammar starts near the top of the body (allowing a short title/heading
+  // preamble); an anchor pair merely embedded deep inside an unrelated long
+  // document — which would otherwise get the SAME density immunity once
+  // both roles are present — sits far past this bound instead.
+  const preambleOk =
+    entry.score_continuations_max_preamble_lines === undefined ||
+    (firstAnchorIndex !== -1 &&
+      firstAnchorIndex <= entry.score_continuations_max_preamble_lines);
+
+  if (
+    entry.score_continuations_as_body &&
+    entry.multi_line &&
+    entry.quick_reject &&
+    anchorCandidates > 0 &&
+    (anchored >= 2 || firstLineAnchored) &&
+    distinctSpeakersOk &&
+    preambleOk
+  ) {
+    return anchored / anchorCandidates;
   }
   return anchored / lines.length;
 }
@@ -400,12 +621,15 @@ function scoreFromLines(
  * Score how well a pattern matches the first N lines of a body (D18).
  * Returns 0..1 ratio of matched lines. Higher = more confident.
  *
- * Quick_reject is honored (lines that don't pass quick_reject still
- * count as "could be continuation"; not penalized).
+ * Quick_reject is honored. Patterns that opt into
+ * `score_continuations_as_body` may exclude continuation lines from the
+ * denominator only after the scorer sees two anchors, or an anchor on the
+ * first non-blank line. Otherwise the ordinary full-body density applies.
  *
  * Exported for tests.
  */
 export function scorePattern(body: string, entry: PatternEntry): number {
+  if (entry.id === 'python-dict-utterance') return scoreFromLines(speakerObjectScoringLines(body, entry, SCORING_HEAD_LINES), entry);
   return scoreFromLines(getNonBlankLines(body, SCORING_HEAD_LINES), entry);
 }
 
@@ -421,6 +645,7 @@ export function scorePattern(body: string, entry: PatternEntry): number {
  * needs full-body scoring of a single pattern.
  */
 export function scorePatternFull(body: string, entry: PatternEntry): number {
+  if (entry.id === 'python-dict-utterance') return scoreFromLines(speakerObjectScoringLines(body, entry), entry);
   return scoreFromLines(getNonBlankLines(body), entry);
 }
 
@@ -440,6 +665,12 @@ export function parseConversation(
   if (!body) {
     return { messages: [], phase: 'no_match' };
   }
+
+  // Pre-pass: collapse block-format chat exports (header + indented body, e.g.
+  // the Slack collector's `- **Name** (Mon 11:18)\n  body…`) into the canonical
+  // single-line shape the built-in patterns recognize. Strict no-op when no
+  // block header is present, so already-canonical content is untouched.
+  body = normalizeBlockConversation(body);
 
   const dateCtx = deriveDateContext(opts);
 
@@ -484,7 +715,7 @@ export function parseConversation(
     const allLines = getNonBlankLines(body);
     scored = candidates.map((entry) => ({
       entry,
-      score: scoreFromLines(allLines, entry),
+      score: entry.id === 'python-dict-utterance' ? scorePatternFull(body, entry) : scoreFromLines(allLines, entry),
       priority: priorityOf(entry.id),
     }));
     sortScored(scored);
@@ -510,7 +741,7 @@ export function parseConversation(
   // candidate; this only tightens its acceptance (a real transcript
   // stays ~1.0; a 3/200-label notes page drops to ~0.015 → no_match).
   if (top.entry.score_full_body && !fullBodyScored) {
-    top.score = scoreFromLines(getNonBlankLines(body), top.entry);
+    top.score = scorePatternFull(body, top.entry);
   }
 
   // Minimum acceptance floor (closes Codex P1 #2): an essay with
@@ -529,7 +760,26 @@ export function parseConversation(
     };
   }
 
-  const messages = applyPattern(body, top.entry, dateCtx);
+  const diag = { unrecognized_headings: [] as string[], date_fallback_count: 0 };
+  const messages = applyPattern(body, top.entry, dateCtx, diag);
+
+  // Structure gate (N12-1): enough turns with every speaker distinct is a
+  // list of labels, not a conversation.
+  const minTurns = top.entry.repeat_speaker_min_turns;
+  if (
+    minTurns !== undefined &&
+    messages.length >= minTurns &&
+    new Set(messages.map((m) => m.speaker)).size === messages.length
+  ) {
+    return {
+      messages: [],
+      phase: 'no_match',
+      patterns_scored: patternsScored,
+      unmatched_line_count: opts.diagnostic
+        ? body.split(/\r?\n/).filter((l) => l.trim().length > 0).length
+        : undefined,
+    };
+  }
 
   // Timezone warning surface (D19).
   let timezone_warning: string | undefined;
@@ -547,6 +797,12 @@ export function parseConversation(
     matched_pattern_id: top.entry.id,
     patterns_scored: patternsScored,
     timezone_warning,
+    // Anchors rescued onto a fallback timestamp; undefined when zero.
+    date_fallback_count: diag.date_fallback_count || undefined,
+    // #4136 — populated unconditionally (NOT behind opts.diagnostic): the
+    // extractor's decline gate depends on it. Undefined when empty.
+    unrecognized_headings:
+      diag.unrecognized_headings.length > 0 ? diag.unrecognized_headings : undefined,
     unmatched_line_count: opts.diagnostic
       ? body
           .split(/\r?\n/)

@@ -57,6 +57,8 @@ This mode guarantees:
 - `skills/manifest.json` lists every skill directory
 - `skills/RESOLVER.md` references every skill in the manifest
 - `openclaw.plugin.json` `skills[]` round-trips with both
+- `openclaw.plugin.json` keeps OpenClaw install-required native plugin fields
+  (`id`, object `configSchema`, and `contracts.contextEngines` when applicable)
 - No MECE violations (duplicate triggers across skills)
 
 ### Phases
@@ -72,7 +74,7 @@ This mode guarantees:
 ### Automation
 
 ```bash
-bun test test/skills-conformance.test.ts test/resolver.test.ts
+bun test test/skills-conformance.test.ts test/resolver.test.ts test/openclaw-plugin-manifest.test.ts
 ```
 
 The CI-gated check is the package.json `test` script.
@@ -228,6 +230,14 @@ This enables:
 - Trend tracking (are we getting better or worse?)
 - Flake detection (same test fails intermittently)
 - Regression velocity (how fast do we break things after changes?)
+
+## When it fails
+
+Follow the [agent operator protocol](../conventions/agent-operator-protocol.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- A test fails because of a missing API key or a flaky provider: classify it as an environment failure, not a code failure, and say which key.
+- A security test fails: always escalate to the user; never auto-fix it.
+- `gbrain doctor` cannot reach the brain (`GBRAIN_DB_ACCESS`): route to the db-repair skill before running integration tests.
 
 ## Anti-Patterns
 
