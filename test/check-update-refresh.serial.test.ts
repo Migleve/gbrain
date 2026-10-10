@@ -9,7 +9,7 @@
  * Quarantined as *.serial.test.ts because it reassigns the process-global
  * `fetch` (cross-file-unsafe under the parallel runner).
  */
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +20,7 @@ import { fetchLatestRelease, parseVersionFileBody, refreshUpdateCache, runCheckU
 
 const realFetch = globalThis.fetch;
 const realLog = console.log;
+let restoreWriter: (() => void) | undefined;
 let homeDir: string;
 let priorHome: string | undefined;
 
@@ -52,6 +53,8 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = realFetch;
   console.log = realLog;
+  restoreWriter?.();
+  restoreWriter = undefined;
   if (priorHome === undefined) delete process.env.GBRAIN_HOME;
   else process.env.GBRAIN_HOME = priorHome;
   rmSync(homeDir, { recursive: true, force: true });
@@ -172,6 +175,11 @@ describe('runCheckUpdate --json — failure discrimination (#486)', () => {
   function capture(): string[] {
     const lines: string[] = [];
     console.log = (...a: unknown[]) => { lines.push(a.join(' ')); };
+    const writer = spyOn(Bun.stdout, 'writer').mockImplementation(() => ({
+      write: (data: string) => { lines.push(data); return Buffer.byteLength(data); },
+      flush: async () => 0,
+    }) as ReturnType<typeof Bun.stdout.writer>);
+    restoreWriter = () => writer.mockRestore();
     return lines;
   }
 

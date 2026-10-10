@@ -372,6 +372,8 @@ jobs:
         shell: bash
         run: bash scripts/run-e2e.sh test/e2e/graduation-cli.test.ts test/e2e/graduation-cli-topologies.test.ts test/e2e/graduation-cli-history.test.ts test/e2e/graduation-cli-zero-mutation-1.test.ts test/e2e/graduation-cli-zero-mutation-2.test.ts test/e2e/graduation-cli-zero-mutation-3.test.ts test/e2e/graduation-clients.test.ts test/e2e/graduation-clients-serve.test.ts test/e2e/graduation-crash-run-1.test.ts test/e2e/graduation-crash-run-2.test.ts test/e2e/graduation-crash-run-3.test.ts test/e2e/graduation-crash-rollback-1.test.ts test/e2e/graduation-crash-rollback-2.test.ts test/e2e/graduation-faults.test.ts test/e2e/graduation-legacy-copy.test.ts
         env:
+          # Compatibility fixtures come from the community releases, not fork tags.
+          GBRAIN_TEST_RELEASE_REMOTE: https://github.com/garrytan/gbrain.git
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
           GBRAIN_PGBOUNCER_URL: postgresql://postgres:postgres@localhost:55433/gbrain_test?prepare=false
           GBRAIN_TEST_ALLOW_DATABASE_URL: '1'

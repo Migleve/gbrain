@@ -155,6 +155,7 @@ for _e2e_var in $(env | grep -oE '^(CONDUCTOR_|MCP_|OPENCLAW_|HERMES_|GROK_|OPEN
     GBRAIN_TEST_KEEP_PROVIDER_KEYS) ;;  # provider-keys preload opt-in (set above) — keep
     GBRAIN_CI_DISABLE_TEST_ENV_FILE) ;;  # CI forbids loading checkout-local .env.testing — keep through Bun startup
     GBRAIN_TEST_DB) ;;  # explicit schema-reset opt-in for service hosts; schema-drift still requires a test-shaped DB name
+    GBRAIN_TEST_RELEASE_REMOTE) ;;  # public repository supplying historical compatibility binaries
     GBRAIN_PGBOUNCER_URL|GBRAIN_PGBOUNCER_DIRECT_URL|GBRAIN_CI_REQUIRE_PGBOUNCER) ;; # explicit pooler test target and execution requirement
     GBRAIN_PGBOUNCER_E2E_URL|GBRAIN_PGBOUNCER_E2E_DB) ;; # backend-matrix pooled target (scripts/e2e-backend-matrix.txt)
     GBRAIN_TEST_WAIT_MULTIPLIER) ;;  # coverage deadline multiplier read by test/helpers/wait-for.ts — keep

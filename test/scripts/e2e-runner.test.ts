@@ -131,6 +131,16 @@ test('fresh process',()=>{
       }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+  test('the release repository fixture survives the runner scrub while operator overrides do not', () => {
+    const root = setup();
+    try {
+      writeFileSync(join(root, 'test/e2e/a.test.ts'), "import {test,expect} from 'bun:test'; test('release fixture',()=>{ expect(process.env.GBRAIN_TEST_RELEASE_REMOTE).toBe('https://github.com/garrytan/gbrain.git'); expect(process.env.GBRAIN_BRAIN_ID).toBeUndefined(); });");
+      const result = spawnSync('bash', ['scripts/run-e2e.sh', 'test/e2e/a.test.ts'], {
+        cwd: root, encoding: 'utf8', env: { ...env, GBRAIN_TEST_RELEASE_REMOTE: 'https://github.com/garrytan/gbrain.git', GBRAIN_BRAIN_ID: 'operator-context' },
+      });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   test('a fully skipped file has execution evidence but need not emit LCOV', () => {
     const root = setup();
     try {
