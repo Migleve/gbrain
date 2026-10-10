@@ -12,6 +12,8 @@ on:
     paths:
       - 'bun.lock'
       - 'package.json'
+      - 'admin/bun.lock'
+      - 'admin/package.json'
       - 'patches/**'
       - 'osv-scanner.toml'
       - 'test/sprintf-precision.test.ts'
