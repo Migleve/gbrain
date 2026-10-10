@@ -3,7 +3,9 @@ name: Semgrep
 # Static analysis (SAST) with Semgrep Community Edition (#2272). Tokenless:
 # uses the public registry rulesets, needs zero secrets.
 # - Pull requests (job `semgrep`, read-only): fail only on findings new since
-#   the merge base.
+#   the merge base. This personal fork gates its additional changes against
+#   the upstream revision already imported; inherited findings remain visible
+#   in the weekly full-tree scan and the integration run's report.
 # - Weekly schedule and dispatch (job `semgrep-full`): full-tree scan, report
 #   only, uploaded as SARIF to code scanning (Security -> Code scanning), so
 #   the findings land somewhere a reviewer reads them. Only this job holds
@@ -45,6 +47,7 @@ jobs:
       - name: Semgrep scan
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           # The container user differs from checkout's owner. Trust only this
           # workspace so our merge-base lookup works before Semgrep starts.
@@ -54,6 +57,15 @@ jobs:
           # so a finding master landed after the event would otherwise be
           # attributed to this PR. merge-base is the true common ancestor.
           BASELINE="$(git merge-base "$BASE_SHA" HEAD || echo "$BASE_SHA")"
+          # This fork consumes upstream releases. Compare fork additions with
+          # the actual upstream ancestor, not with an obsolete fork release.
+          # Fetch/ancestry failures fail the job; never fall back to HEAD.
+          if [ "$REPOSITORY" = 'Migleve/gbrain' ]; then
+            git fetch --no-tags https://github.com/garrytan/gbrain.git master
+            BASELINE="$(git merge-base FETCH_HEAD HEAD)"
+            git merge-base --is-ancestor "$BASELINE" HEAD
+            echo "Inherited upstream findings remain covered by the full-tree scan."
+          fi
           echo "PR scan — failing only on findings new since $BASELINE"
           semgrep scan --config p/default --config p/typescript --error --baseline-commit "$BASELINE"
 
