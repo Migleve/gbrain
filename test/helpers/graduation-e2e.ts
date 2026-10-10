@@ -281,7 +281,8 @@ export const FIRST_GRADUATION_RELEASE = '0.60.52.0';
 export function previousReleaseTags(count = 2): string[] {
   const version = [readFileSync(join(REPO, 'VERSION'), 'utf8').trim(), FIRST_GRADUATION_RELEASE]
     .sort((a, b) => cmpVersion(a.split('.').map(Number), b.split('.').map(Number)))[0]!;
-  const out = Bun.spawnSync(['git', '-C', REPO, 'ls-remote', '--tags', '--refs', 'origin', 'v*'], { stdout: 'pipe', stderr: 'pipe' });
+  const remote = process.env.GBRAIN_TEST_RELEASE_REMOTE || 'origin';
+  const out = Bun.spawnSync(['git', '-C', REPO, 'ls-remote', '--tags', '--refs', remote, 'v*'], { stdout: 'pipe', stderr: 'pipe' });
   if (out.exitCode !== 0) throw new Error(`git ls-remote failed: ${out.stderr.toString()}`);
   const parse = (tag: string) => tag.slice(1).split('.').map(Number);
   const cmp = (a: number[], b: number[]) => { for (let i = 0; i < Math.max(a.length, b.length); i++) { const d = (a[i] ?? 0) - (b[i] ?? 0); if (d) return d; } return 0; };
@@ -311,7 +312,7 @@ export function olderReleaseBinary(tag: string): string {
     const r = Bun.spawnSync(argv, { cwd, stdout: 'pipe', stderr: 'pipe' });
     if (r.exitCode !== 0) throw new Error(`${argv.join(' ')}: ${r.stderr.toString().slice(-2000)}`);
   };
-  run(['git', 'fetch', '-q', 'origin', 'tag', tag, '--no-tags']);
+  run(['git', 'fetch', '-q', process.env.GBRAIN_TEST_RELEASE_REMOTE || 'origin', 'tag', tag, '--no-tags']);
   if (!existsSync(tree)) run(['git', 'worktree', 'add', '-q', '--detach', tree, tag]);
   run([process.execPath, 'install', '--frozen-lockfile', '--ignore-scripts'], tree);
   run([process.execPath, 'build', '--compile', '--no-compile-autoload-bunfig', '--outfile', 'bin/gbrain', 'src/cli.ts'], tree);

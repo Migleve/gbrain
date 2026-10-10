@@ -76,11 +76,12 @@ permissions: {}
 jobs:
   resolve:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      github.event.repository.has_issues &&
+      (github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.head_repository.full_name == github.repository &&
        (github.event.workflow_run.event == 'schedule' ||
         (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'master' &&
-         contains(fromJSON('["Test","E2E Tests"]'), github.event.workflow_run.name))))
+         contains(fromJSON('["Test","E2E Tests"]'), github.event.workflow_run.name)))))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

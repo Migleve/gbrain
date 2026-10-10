@@ -781,6 +781,7 @@ describe('nightly-watch routing and guard', () => {
     expect(w.on.workflow_dispatch.inputs.run_id.description).toBe('Scheduled or push-to-master run id to evaluate');
     expect(w.on.workflow_dispatch.inputs.replay_issue).toBeDefined();
     const guard: string = w.jobs.resolve.if;
+    expect(guard).toMatch(/^github\.event\.repository\.has_issues &&/);
     for (const part of ["github.event_name == 'workflow_dispatch'", 'head_repository.full_name == github.repository', "workflow_run.event == 'schedule'", "workflow_run.event == 'push'", "head_branch == 'master'", '["Test","E2E Tests"]']) expect(guard).toContain(part);
     expect(Object.keys(PUSH_ALLOWLIST).sort()).toEqual(['E2E Tests', 'Test']);
     expect(w.concurrency).toBeUndefined();

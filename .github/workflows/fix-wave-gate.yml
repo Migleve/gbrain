@@ -25,6 +25,7 @@ concurrency:
 
 jobs:
   contributor-gate:
+    if: github.repository == 'garrytan/gbrain'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -45,7 +46,7 @@ jobs:
         run: bun scripts/fix-wave-gate.ts
 
   welcome-comment:
-    if: github.event.action == 'opened'
+    if: github.repository == 'garrytan/gbrain' && github.event.action == 'opened'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
