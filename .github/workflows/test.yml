@@ -314,6 +314,8 @@ jobs:
       # timeout, self-skip) as one JUnit testcase; logs stay on failure.
       - run: bun run verify
         env:
+          # GitHub-hosted runners need more time than upstream's 8-vCPU runners.
+          GBRAIN_VERIFY_TIMEOUT: 600
           GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
           GBRAIN_VERIFY_LOG_DIR: ${{ runner.temp }}/verify-logs
       - name: Upload verify logs
