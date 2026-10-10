@@ -9,8 +9,6 @@ name: Heavy Tests
 # See CLAUDE.md "tests/heavy/*.sh" entry and tests/heavy/README.md.
 
 on:
-  schedule:
-    - cron: '17 8 * * *'  # 08:17 UTC daily — staggered to avoid noisy slots
   pull_request:
     # `synchronize` + `reopened` fire on subsequent pushes / reopens — without
     # them, a PR labeled `heavy-tests` would NEVER re-run heavy on later
