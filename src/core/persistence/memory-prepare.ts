@@ -16,6 +16,7 @@ import type { WriteRequest } from './model.ts';
 import { appendContextNote, type InferredVia } from '../facts/subject-infer.ts';
 import { inferenceNote } from '../facts/subject-infer-write.ts';
 import { normalizeTargetFences } from '../fence-repair/import-step.ts';
+import { refuseUnparsedRewrite } from '../fence-repair/refusal.ts';
 import { requestChannelTrust } from '../trust/channel.ts';
 import { gateField, gateInput, heldOutcome, loadWriteGateConfig } from '../trust/gate-outcomes.ts';
 import { decideFactWrite, recordFlaggedRow, recordWriteGateHold } from '../write-gate-store.ts';
@@ -25,6 +26,7 @@ import { storedTrustTier } from '../trust/tier.ts';
 import { pageFencesNormalized } from '../fence-repair/report.ts';
 import { fenceAppendPendingTier, withPendingFenceRows } from '../eligibility/fence-overlay.ts';
 import { withPageTierKept } from '../trust/fence-append.ts';
+import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 
 function receiptFix(row: WriteRequest): Action {
   return row.principal_kind === 'local_cli'
@@ -80,9 +82,10 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
   const dedupEmbedding = p.entity_inferred ? null : embedding;
   // `replaces`: the caller names the fact this one replaces (checked; the cosine rule does not apply).
   const replaces = p.replaces !== undefined && p.replaces !== null ? Number(p.replaces) : null;
+  const excludePrivate = await resolveExcludePrivatePages(engine, row.authority.remote === true);
   const decide = (e: BrainEngine, lock = false) => replaces !== null
-    ? decideReplacement(e, row.source_id, input, replaces, { pageSlug: row.slug, remote: row.authority.remote === true, lock })
-    : decideSingleFact(e, row.source_id, input, dedupEmbedding, embedding_model);
+    ? decideReplacement(e, row.source_id, input, replaces, { pageSlug: row.slug, remote: row.authority.remote === true, lock, excludePrivate })
+    : decideSingleFact(e, row.source_id, input, dedupEmbedding, embedding_model, undefined, { excludePrivate });
   const decision = await decide(engine);
   // #5575 I3: a lower-tier write never supersedes; it is inserted contested and the owner decides (re-checked under lock by validate).
   const writerTier = requestChannelTrust(row)?.tier ?? 'unknown';
@@ -124,9 +127,10 @@ export async function prepareMemoryMutation(engine: BrainEngine, row: WriteReque
     const target = await normalizeTargetFences(engine, { sourceId: row.source_id, slug: row.slug, kind: 'facts', page: snapshot.page });
     if (target.fixes.length) fencesNormalized = { fences_normalized: pageFencesNormalized({ sourceId: row.source_id, slug: row.slug, fixes: target.fixes,
       writer: row.principal_kind, path: snapshot.page.source_path ?? null, remote: row.authority.remote }) };
-    const appended = upsertFactRow(target.page.compiled_truth, { claim: input.fact, kind: input.kind, visibility: input.visibility,
-      confidence: 1, notability: 'medium', validFrom: formatFenceDate(validFrom),
-      validUntil: validUntil ? formatFenceDate(validUntil) : undefined, source: fact.source, context });
+    // #6385 R12: an entity fence that does not parse cleanly refuses typed instead of losing the rows it skipped.
+    const appended = refuseUnparsedRewrite(target.page, row.slug, row.source_id, () => upsertFactRow(target.page.compiled_truth, {
+      claim: input.fact, kind: input.kind, visibility: input.visibility, confidence: 1, notability: 'medium', validFrom: formatFenceDate(validFrom),
+      validUntil: validUntil ? formatFenceDate(validUntil) : undefined, source: fact.source, context }));
     rowNum = appended.rowNum;
     let body = appended.body;
     const old = decision.candidate;
